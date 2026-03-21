@@ -184,45 +184,86 @@ async fn main() -> Result<()> {
             port,
             json,
             auto_reassign,
-            dry_run: _,
+            dry_run,
         } => {
-            let project = resolve_project(project)?;
-            let requested_port = port;
-            let response = send_request(Request::Allocate {
-                project,
-                service,
-                preferred_port: requested_port,
-                protocol: Protocol::Tcp,
-                auto_reassign,
-                pid: Some(std::process::id()),
-            })
-            .await?;
+            if dry_run {
+                let port = port.context("--dry-run requires --port")?;
+                let bindable = port_check::is_port_available(port, Protocol::Tcp);
+                let leases = load_active_leases()?;
+                let managed = leases.iter().find(|l| l.port == port && l.protocol == Protocol::Tcp);
 
-            match response {
-                Response::Allocated { lease } => {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&lease)?);
-                    } else {
-                        println!("✓ Allocated port {} for service '{}'", lease.port, lease.service_name);
-                        println!("  Lease ID: {}", lease.lease_id);
-                        println!("  Token:    {}", lease.session_token);
-                        println!("  Expires:  {}", lease.expires_at);
-                        if let Some(requested_port) = requested_port {
-                            if requested_port != lease.port {
-                                println!("  Reassigned from requested port {}", requested_port);
-                            }
-                        }
-                        println!();
-                        println!(
-                            "  Confirm after binding:  portus confirm --lease-id {} --token {}",
-                            lease.lease_id, lease.session_token
-                        );
+                let (available, reason) = match (bindable, managed) {
+                    (true, None) => (true, None),
+                    (false, Some(lease)) => (
+                        false,
+                        Some(format!(
+                            "allocated to service '{}' (lease {})",
+                            lease.service_name, lease.lease_id
+                        )),
+                    ),
+                    (false, None) => (false, Some("port is in use by another process".into())),
+                    (true, Some(lease)) => (
+                        false,
+                        Some(format!(
+                            "allocated to service '{}' (lease {}) but not yet bound",
+                            lease.service_name, lease.lease_id
+                        )),
+                    ),
+                };
+
+                if json {
+                    let mut obj = serde_json::json!({
+                        "available": available,
+                        "port": port,
+                    });
+                    if let Some(reason) = &reason {
+                        obj["reason"] = serde_json::Value::String(reason.clone());
                     }
+                    println!("{}", serde_json::to_string_pretty(&obj)?);
+                } else if available {
+                    println!("Port {} is available", port);
+                } else {
+                    println!("Port {} is not available: {}", port, reason.unwrap());
                 }
-                Response::Error { code, message } => {
-                    bail!("{}", format_daemon_error(&code, &message));
+            } else {
+                let project = resolve_project(project)?;
+                let requested_port = port;
+                let response = send_request(Request::Allocate {
+                    project,
+                    service,
+                    preferred_port: requested_port,
+                    protocol: Protocol::Tcp,
+                    auto_reassign,
+                    pid: Some(std::process::id()),
+                })
+                .await?;
+
+                match response {
+                    Response::Allocated { lease } => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&lease)?);
+                        } else {
+                            println!("✓ Allocated port {} for service '{}'", lease.port, lease.service_name);
+                            println!("  Lease ID: {}", lease.lease_id);
+                            println!("  Token:    {}", lease.session_token);
+                            println!("  Expires:  {}", lease.expires_at);
+                            if let Some(requested_port) = requested_port {
+                                if requested_port != lease.port {
+                                    println!("  Reassigned from requested port {}", requested_port);
+                                }
+                            }
+                            println!();
+                            println!(
+                                "  Confirm after binding:  portus confirm --lease-id {} --token {}",
+                                lease.lease_id, lease.session_token
+                            );
+                        }
+                    }
+                    Response::Error { code, message } => {
+                        bail!("{}", format_daemon_error(&code, &message));
+                    }
+                    other => bail!("unexpected response: {:?}", other),
                 }
-                other => bail!("unexpected response: {:?}", other),
             }
         }
 
@@ -364,32 +405,55 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Kill { port, signal, json, dry_run: _ } => {
+        Commands::Kill { port, signal, json, dry_run } => {
             let signal = parse_signal(&signal)?;
             let rows = build_scan_rows(Some(port))?;
             if rows.is_empty() {
                 bail!("no listening process found on port {}", port);
             }
 
-            let killed = kill_processes_on_port(port, signal)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&rows)?);
+            if dry_run {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    println!("Would kill {} process(es) on port {} with {}:", rows.len(), port, signal);
+                    for row in &rows {
+                        let managed = if row.managed {
+                            format!(
+                                "managed by {}:{}",
+                                row.project.as_deref().unwrap_or("unknown-project"),
+                                row.service.as_deref().unwrap_or("unknown-service"),
+                            )
+                        } else {
+                            "unmanaged".into()
+                        };
+                        println!(
+                            "  Would kill: pid={} proto={:?} cmd={} ({})",
+                            row.pid, row.protocol, row.command, managed
+                        );
+                    }
+                }
             } else {
-                println!("✓ Sent {} to {} process(es) on port {}", signal, unique_pid_count(&killed), port);
-                for row in rows {
-                    let managed = if row.managed {
-                        format!(
-                            "managed by {}:{}",
-                            row.project.unwrap_or_else(|| "unknown-project".into()),
-                            row.service.unwrap_or_else(|| "unknown-service".into())
-                        )
-                    } else {
-                        "unmanaged".into()
-                    };
-                    println!(
-                        "  pid={} proto={:?} cmd={} ({})",
-                        row.pid, row.protocol, row.command, managed
-                    );
+                let killed = kill_processes_on_port(port, signal)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    println!("✓ Sent {} to {} process(es) on port {}", signal, unique_pid_count(&killed), port);
+                    for row in rows {
+                        let managed = if row.managed {
+                            format!(
+                                "managed by {}:{}",
+                                row.project.unwrap_or_else(|| "unknown-project".into()),
+                                row.service.unwrap_or_else(|| "unknown-service".into())
+                            )
+                        } else {
+                            "unmanaged".into()
+                        };
+                        println!(
+                            "  pid={} proto={:?} cmd={} ({})",
+                            row.pid, row.protocol, row.command, managed
+                        );
+                    }
                 }
             }
         }
