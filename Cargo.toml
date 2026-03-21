@@ -36,5 +36,6 @@ widestring = "1"
 anyhow = { workspace = true }
 interprocess = { workspace = true }
 portus-core = { workspace = true }
+serde_json = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }

@@ -840,6 +840,7 @@ dependencies = [
  "anyhow",
  "interprocess",
  "portus-core",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

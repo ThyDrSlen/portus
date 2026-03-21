@@ -96,6 +96,11 @@ struct LeaseInfo {
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
+struct ListPortsResult {
+    leases: Vec<LeaseInfo>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 struct CheckPortResult {
     available: bool,
     holder: Option<LeaseInfo>,
@@ -166,7 +171,7 @@ impl PortusServer {
     async fn list_ports(
         &self,
         Parameters(params): Parameters<ListPortsParams>,
-    ) -> Result<Json<Vec<LeaseInfo>>, String> {
+    ) -> Result<Json<ListPortsResult>, String> {
         let project_filter = params
             .project
             .map(|project| crate::resolve_project(Some(project)).map_err(|err| err.to_string()))
@@ -176,7 +181,9 @@ impl PortusServer {
             .map_err(|err| err.to_string())?;
 
         match response {
-            Response::LeaseList { leases } => Ok(Json(leases.iter().map(LeaseInfo::from).collect())),
+            Response::LeaseList { leases } => Ok(Json(ListPortsResult {
+                leases: leases.iter().map(LeaseInfo::from).collect(),
+            })),
             Response::Error { code, message } => Err(crate::format_daemon_error(&code, &message)),
             other => Err(format!("unexpected response: {:?}", other)),
         }
@@ -284,4 +291,95 @@ pub(crate) async fn serve_stdio() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_router_has_five_tools() {
+        let router = PortusServer::tool_router();
+        let tools = router.list_all();
+        assert_eq!(tools.len(), 5, "got: {:?}", tools.iter().map(|t| &t.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn tool_names_match_expected() {
+        let router = PortusServer::tool_router();
+        let tools = router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| &*t.name).collect();
+        for expected in ["allocate_port", "release_port", "list_ports", "check_port", "daemon_status"] {
+            assert!(names.contains(&expected), "missing tool: {expected}");
+        }
+    }
+
+    #[test]
+    fn all_tools_have_descriptions() {
+        let router = PortusServer::tool_router();
+        for tool in router.list_all() {
+            assert!(
+                tool.description.as_ref().is_some_and(|d| !d.is_empty()),
+                "tool '{}' should have a non-empty description",
+                tool.name,
+            );
+        }
+    }
+
+    #[test]
+    fn all_tools_have_input_schemas() {
+        let router = PortusServer::tool_router();
+        for tool in router.list_all() {
+            let schema = &tool.input_schema;
+            assert_eq!(
+                schema.get("type").and_then(|v| v.as_str()),
+                Some("object"),
+                "tool '{}' input_schema type should be 'object'",
+                tool.name,
+            );
+        }
+    }
+
+    #[test]
+    fn allocate_port_schema_requires_service() {
+        let router = PortusServer::tool_router();
+        let tools = router.list_all();
+        let alloc = tools.iter().find(|t| t.name == "allocate_port").unwrap();
+        let props = alloc.input_schema.get("properties")
+            .and_then(|v| v.as_object())
+            .expect("allocate_port should have properties");
+        assert!(props.contains_key("service"), "allocate_port should have 'service' property");
+        let required = alloc.input_schema.get("required")
+            .and_then(|v| v.as_array())
+            .expect("allocate_port should have required array");
+        let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(required_names.contains(&"service"), "allocate_port should require 'service'");
+    }
+
+    #[test]
+    fn server_info_enables_tools() {
+        let server = PortusServer::new();
+        let info = server.get_info();
+        assert!(info.capabilities.tools.is_some(), "server should advertise tools capability");
+    }
+
+    #[test]
+    fn read_only_tools_have_annotations() {
+        let router = PortusServer::tool_router();
+        let tools = router.list_all();
+        let read_only_tools = ["list_ports", "check_port", "daemon_status"];
+        for tool in &tools {
+            if read_only_tools.contains(&&*tool.name) {
+                let annotations = tool.annotations.as_ref().unwrap_or_else(|| {
+                    panic!("tool '{}' should have annotations", tool.name)
+                });
+                assert_eq!(
+                    annotations.read_only_hint,
+                    Some(true),
+                    "tool '{}' should have read_only_hint=true",
+                    tool.name,
+                );
+            }
+        }
+    }
 }
