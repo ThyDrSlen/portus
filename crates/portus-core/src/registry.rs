@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -77,11 +79,18 @@ impl Registry {
         }
 
         let tmp_path = path.with_extension("toml.tmp");
-        std::fs::write(&tmp_path, &content)
+        let mut tmp_file = File::create(&tmp_path)
+            .with_context(|| format!("failed to create temp registry {}", tmp_path.display()))?;
+        tmp_file
+            .write_all(content.as_bytes())
             .with_context(|| format!("failed to write temp registry {}", tmp_path.display()))?;
+        tmp_file
+            .sync_all()
+            .with_context(|| format!("failed to sync temp registry {}", tmp_path.display()))?;
         #[cfg(unix)]
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set registry permissions: {}", tmp_path.display()))?;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).with_context(
+            || format!("failed to set registry permissions: {}", tmp_path.display()),
+        )?;
         std::fs::rename(&tmp_path, path).with_context(|| {
             format!(
                 "failed to rename {} -> {}",
@@ -89,6 +98,14 @@ impl Registry {
                 path.display()
             )
         })?;
+        // Sync parent directory to ensure rename is durable
+        if let Some(parent) = path.parent() {
+            let parent_dir = File::open(parent)
+                .with_context(|| format!("failed to open parent directory {}", parent.display()))?;
+            parent_dir
+                .sync_all()
+                .with_context(|| format!("failed to sync parent directory {}", parent.display()))?;
+        }
         debug!(path = %path.display(), "registry saved");
         Ok(())
     }
@@ -524,7 +541,8 @@ mod tests {
         assert!(content.contains("confirmed_at"));
         assert!(!tmp_path.exists());
 
-        reg.heartbeat(&lease.lease_id, &lease.session_token).unwrap();
+        reg.heartbeat(&lease.lease_id, &lease.session_token)
+            .unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("last_heartbeat_at"));
         assert!(!tmp_path.exists());
@@ -568,5 +586,67 @@ mod tests {
             assert_eq!(lease.session_token, token);
             assert_eq!(lease.service_name, "api");
         }
+    }
+
+    #[test]
+    fn auto_reassign_on_registry_conflict() {
+        let mut reg = test_registry();
+        // Allocate port 9886 for service A with auto_reassign: false
+        let lease_a = reg
+            .allocate(
+                "/tmp/app_a".into(),
+                "svc_a".into(),
+                Some(9886),
+                Protocol::Tcp,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(lease_a.port, 9886);
+
+        // Try to allocate port 9886 for service B with auto_reassign: true
+        // Should succeed with a port from the auto range (>= 10000)
+        let lease_b = reg
+            .allocate(
+                "/tmp/app_b".into(),
+                "svc_b".into(),
+                Some(9886),
+                Protocol::Tcp,
+                true,
+                None,
+            )
+            .unwrap();
+        assert!(lease_b.port >= 10000 && lease_b.port <= 19999);
+        assert_ne!(lease_b.port, 9886);
+    }
+
+    #[test]
+    fn auto_reassign_false_rejects_conflict() {
+        let mut reg = test_registry();
+        // Allocate port 9887 for service A with auto_reassign: false
+        let _lease_a = reg
+            .allocate(
+                "/tmp/app_a".into(),
+                "svc_a".into(),
+                Some(9887),
+                Protocol::Tcp,
+                false,
+                None,
+            )
+            .unwrap();
+
+        // Try to allocate port 9887 for service B with auto_reassign: false
+        // Should fail with "already allocated" error
+        let result = reg.allocate(
+            "/tmp/app_b".into(),
+            "svc_b".into(),
+            Some(9887),
+            Protocol::Tcp,
+            false,
+            None,
+        );
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("already allocated"));
     }
 }
