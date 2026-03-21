@@ -12,6 +12,7 @@ use portus_core::registry::Registry;
 use portus_core::scan::{kill_processes_on_port, scan_ports};
 use portus_core::{ipc, paths, transport};
 use serde::Serialize;
+use tokio::signal::unix::SignalKind;
 
 #[derive(Parser)]
 #[command(name = "portus", about = "Port collision prevention for developers")]
@@ -430,18 +431,57 @@ async fn main() -> Result<()> {
                 }
             });
 
-            let status = child.wait().await.context("failed to wait for child")?;
+            let mut terminate = tokio::signal::unix::signal(SignalKind::terminate())
+                .context("failed to install SIGTERM handler")?;
 
-            let _ = heartbeat_tx.send(());
-            let _ = heartbeat_task.await;
-            let _ = send_request(Request::Release {
-                lease_id: lease.lease_id.clone(),
-                session_token: lease.session_token.clone(),
-            })
-            .await;
+            let exit_code = tokio::select! {
+                status = child.wait() => {
+                    let status = status.context("failed to wait for child")?;
 
-            eprintln!("✓ Released port {} for service '{}'", lease.port, service);
-            std::process::exit(status.code().unwrap_or(1));
+                    let _ = heartbeat_tx.send(());
+                    let _ = heartbeat_task.await;
+                    let _ = send_request(Request::Release {
+                        lease_id: lease.lease_id.clone(),
+                        session_token: lease.session_token.clone(),
+                    })
+                    .await;
+
+                    eprintln!("✓ Released port {} for service '{}'", lease.port, service);
+                    status.code().unwrap_or(1)
+                }
+                result = tokio::signal::ctrl_c() => {
+                    result.context("failed to listen for SIGINT")?;
+
+                    let _ = heartbeat_tx.send(());
+                    let _ = heartbeat_task.await;
+                    let _ = send_request(Request::Release {
+                        lease_id: lease.lease_id.clone(),
+                        session_token: lease.session_token.clone(),
+                    })
+                    .await;
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+
+                    eprintln!("✓ Released port {} for service '{}'", lease.port, service);
+                    130
+                }
+                _ = terminate.recv() => {
+                    let _ = heartbeat_tx.send(());
+                    let _ = heartbeat_task.await;
+                    let _ = send_request(Request::Release {
+                        lease_id: lease.lease_id.clone(),
+                        session_token: lease.session_token.clone(),
+                    })
+                    .await;
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+
+                    eprintln!("✓ Released port {} for service '{}'", lease.port, service);
+                    143
+                }
+            };
+
+            std::process::exit(exit_code);
         }
 
         Commands::Daemon { action } => match action {
