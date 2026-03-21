@@ -14,6 +14,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+/// MCP server implementation for Portus port allocation.
 #[derive(Debug, Clone)]
 pub(crate) struct PortusServer {
     tool_router: ToolRouter<Self>,
@@ -41,76 +42,119 @@ impl ServerHandler for PortusServer {
     }
 }
 
+/// Parameters for the allocate_port MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct AllocatePortParams {
+    /// Service name to allocate a port for.
     service: String,
+    /// Preferred port number (optional).
     port: Option<u16>,
+    /// Project path (optional).
     project: Option<String>,
+    /// Whether to auto-reassign if preferred port is unavailable.
     auto_reassign: Option<bool>,
 }
 
+/// Parameters for the release_port MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ReleasePortParams {
+    /// Lease ID to release.
     lease_id: String,
+    /// Session token for authentication.
     token: String,
 }
 
+/// Parameters for the list_ports MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ListPortsParams {
+    /// Project path filter (optional).
     project: Option<String>,
 }
 
+/// Parameters for the check_port MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CheckPortParams {
+    /// Port number to check.
     port: u16,
 }
 
+/// Result of the allocate_port MCP tool.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct AllocatePortResult {
+    /// Allocated port number.
     port: u16,
+    /// Lease ID for the allocation.
     lease_id: String,
+    /// Session token for future operations.
     token: String,
+    /// Expiration time in RFC3339 format.
     expires_at: String,
 }
 
+/// Result of the release_port MCP tool.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct ReleasePortResult {
+    /// Whether the release was successful.
     released: bool,
+    /// Lease ID that was released.
     lease_id: String,
 }
 
+/// Information about a port lease.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct LeaseInfo {
+    /// Unique lease identifier.
     lease_id: String,
+    /// Project path associated with the lease.
     project_path: String,
+    /// Service name for the lease.
     service_name: String,
+    /// Allocated port number.
     port: u16,
+    /// Protocol (tcp or udp).
     protocol: String,
+    /// Current lease state.
     state: String,
+    /// Client process ID (if available).
     client_pid: Option<u32>,
+    /// Session token for operations.
     token: String,
+    /// When the lease was granted.
     granted_at: String,
+    /// When the lease was confirmed (if confirmed).
     confirmed_at: Option<String>,
+    /// Last heartbeat timestamp (if any).
     last_heartbeat_at: Option<String>,
+    /// When the lease expires.
     expires_at: String,
 }
 
+/// Result of the list_ports MCP tool.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct ListPortsResult {
+    /// List of active leases.
     leases: Vec<LeaseInfo>,
 }
 
+/// Result of the check_port MCP tool.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct CheckPortResult {
+    /// Whether the port is available.
     available: bool,
+    /// Lease holding the port (if any).
     holder: Option<LeaseInfo>,
+    /// Reason if port is unavailable.
     reason: Option<String>,
 }
 
+/// Result of the daemon_status MCP tool.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct DaemonStatusResult {
+    /// Daemon process ID.
     pid: u32,
+    /// Daemon uptime in seconds.
     uptime: u64,
+    /// Number of active leases.
     active_leases: usize,
 }
 
@@ -279,6 +323,7 @@ impl From<&Lease> for LeaseInfo {
     }
 }
 
+/// Start the MCP server on stdio.
 pub(crate) async fn serve_stdio() -> Result<()> {
     let server = PortusServer::new()
         .serve(stdio())

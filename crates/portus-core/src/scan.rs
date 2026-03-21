@@ -6,14 +6,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Protocol;
 
+/// Information about a process listening on a port.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortProcess {
+    /// The port number.
     pub port: u16,
+    /// The process ID.
     pub pid: u32,
+    /// The command name of the process.
     pub command: String,
+    /// The protocol (TCP or UDP).
     pub protocol: Protocol,
 }
 
+/// Scan for listening processes on a specific port or all ports.
+/// Returns a sorted list of processes listening on the given port(s).
 pub fn scan_ports(port: Option<u16>) -> Result<Vec<PortProcess>> {
     #[cfg(unix)]
     {
@@ -33,7 +40,8 @@ pub fn scan_ports(port: Option<u16>) -> Result<Vec<PortProcess>> {
     }
 }
 
-
+/// Kill processes listening on a specific port using the given signal.
+/// Returns the list of processes that were killed.
 pub fn kill_processes_on_port(port: u16, signal: &str) -> Result<Vec<PortProcess>> {
     #[cfg(unix)]
     {
@@ -117,7 +125,10 @@ fn scan_protocol(protocol: Protocol, port: Option<u16>) -> Result<Vec<PortProces
 
     let output = command.output().context("failed to execute lsof")?;
     if output.status.success() {
-        return Ok(parse_lsof_output(&String::from_utf8_lossy(&output.stdout), protocol));
+        return Ok(parse_lsof_output(
+            &String::from_utf8_lossy(&output.stdout),
+            protocol,
+        ));
     }
 
     if output.status.code() == Some(1) {
@@ -165,7 +176,7 @@ fn parse_lsof_output(output: &str, protocol: Protocol) -> Vec<PortProcess> {
 fn extract_port(line: &str) -> Option<u16> {
     line.split_whitespace()
         .rev()
-        .find_map(|token| extract_port_from_token(token))
+        .find_map(extract_port_from_token)
 }
 
 fn extract_port_from_token(token: &str) -> Option<u16> {
@@ -201,13 +212,16 @@ mod tests {
         let line = "Python 123 user 4u IPv4 0x123 0t0 TCP 127.0.0.1:43123 (LISTEN)";
         assert_eq!(extract_port(line), Some(43123));
     }
-
 }
 
 #[cfg(windows)]
 fn scan_windows(port: Option<u16>) -> Result<Vec<PortProcess>> {
     let mut listeners = Vec::new();
-    listeners.extend(parse_netstat_output(run_netstat("tcp")?, Protocol::Tcp, port)?);
+    listeners.extend(parse_netstat_output(
+        run_netstat("tcp")?,
+        Protocol::Tcp,
+        port,
+    )?);
     listeners.sort_by(|a, b| {
         a.port
             .cmp(&b.port)
@@ -230,7 +244,11 @@ fn run_netstat(protocol: &str) -> Result<String> {
 }
 
 #[cfg(windows)]
-fn parse_netstat_output(output: String, protocol: Protocol, target_port: Option<u16>) -> Result<Vec<PortProcess>> {
+fn parse_netstat_output(
+    output: String,
+    protocol: Protocol,
+    target_port: Option<u16>,
+) -> Result<Vec<PortProcess>> {
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
 
@@ -239,7 +257,10 @@ fn parse_netstat_output(output: String, protocol: Protocol, target_port: Option<
         if columns.len() < 4 {
             continue;
         }
-        if !columns[0].eq_ignore_ascii_case(match protocol { Protocol::Tcp => "TCP", Protocol::Udp => "UDP" }) {
+        if !columns[0].eq_ignore_ascii_case(match protocol {
+            Protocol::Tcp => "TCP",
+            Protocol::Udp => "UDP",
+        }) {
             continue;
         }
 
@@ -256,7 +277,12 @@ fn parse_netstat_output(output: String, protocol: Protocol, target_port: Option<
             continue;
         };
         let command = windows_process_name(pid).unwrap_or_else(|_| format!("pid-{}", pid));
-        let entry = PortProcess { port, pid, command, protocol };
+        let entry = PortProcess {
+            port,
+            pid,
+            command,
+            protocol,
+        };
         if seen.insert((entry.port, entry.pid, format!("{:?}", entry.protocol))) {
             entries.push(entry);
         }
@@ -283,5 +309,10 @@ fn windows_process_name(pid: u32) -> Result<String> {
     if line.is_empty() || line.starts_with("INFO:") {
         bail!("process not found for pid {}", pid);
     }
-    Ok(line.trim_matches('"').split("\",\"").next().unwrap_or_default().to_string())
+    Ok(line
+        .trim_matches('"')
+        .split("\",\"")
+        .next()
+        .unwrap_or_default()
+        .to_string())
 }

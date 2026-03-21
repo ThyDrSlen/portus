@@ -1,4 +1,5 @@
 mod dashboard;
+mod helpers;
 mod mcp;
 
 use std::process::Stdio;
@@ -7,9 +8,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use interprocess::local_socket::traits::tokio::Stream as _;
 use clap::{Parser, Subcommand};
-use portus_core::model::{Lease, LeaseState, Protocol};
+use portus_core::model::{Lease, Protocol};
 use portus_core::protocol::{Request, Response};
-use portus_core::registry::Registry;
 use portus_core::port_check;
 use portus_core::scan::{kill_processes_on_port, scan_ports};
 use portus_core::{ipc, paths, transport};
@@ -199,7 +199,7 @@ async fn main() -> Result<()> {
             if dry_run {
                 let port = port.context("--dry-run requires --port")?;
                 let bindable = port_check::is_port_available(port, Protocol::Tcp);
-                let leases = load_active_leases()?;
+                let leases = helpers::load_active_leases()?;
                 let managed = leases.iter().find(|l| l.port == port && l.protocol == Protocol::Tcp);
 
                 let (available, reason) = match (bindable, managed) {
@@ -392,7 +392,7 @@ async fn main() -> Result<()> {
                     None => println!("No listeners found."),
                 }
             } else {
-                println!("{:<8} {:<8} {:<8} {:<14} {:<12} {}", "PORT", "PID", "PROTO", "MANAGED", "SERVICE", "COMMAND");
+                println!("{:<8} {:<8} {:<8} {:<14} {:<12} COMMAND", "PORT", "PID", "PROTO", "MANAGED", "SERVICE");
                 println!("{}", "-".repeat(72));
                 for row in rows {
                     println!(
@@ -686,7 +686,7 @@ fn parse_signal(signal: &str) -> Result<&'static str> {
 
 fn build_scan_rows(port: Option<u16>) -> Result<Vec<ScanRow>> {
     let listeners = scan_ports(port)?;
-    let leases = load_active_leases()?;
+    let leases = helpers::load_active_leases()?;
     let mut rows = Vec::new();
 
     for listener in listeners {
@@ -709,22 +709,7 @@ fn build_scan_rows(port: Option<u16>) -> Result<Vec<ScanRow>> {
     Ok(rows)
 }
 
-fn load_active_leases() -> Result<Vec<Lease>> {
-    let registry_path = paths::registry_path()?;
-    if !registry_path.exists() {
-        return Ok(Vec::new());
-    }
 
-    let registry = Registry::load(&registry_path)?;
-    let mut leases: Vec<Lease> = registry
-        .list(None)
-        .into_iter()
-        .filter(|lease| matches!(lease.state, LeaseState::Pending | LeaseState::Active))
-        .cloned()
-        .collect();
-    leases.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.service_name.cmp(&b.service_name)));
-    Ok(leases)
-}
 
 fn is_child_listening(port: u16, pid: u32, protocol: Protocol) -> Result<bool> {
     let listeners = scan_ports(Some(port))?;

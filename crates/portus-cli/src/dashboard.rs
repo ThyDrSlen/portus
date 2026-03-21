@@ -4,10 +4,11 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use portus_core::model::{Lease, LeaseState};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use portus_core::model::Lease;
 use portus_core::paths;
-use portus_core::registry::Registry;
 use portus_core::scan::{scan_ports, PortProcess};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -79,7 +80,7 @@ impl DashboardSnapshot {
         };
 
         let mut errors = Vec::new();
-        let leases = match load_active_leases() {
+        let leases = match super::helpers::load_active_leases() {
             Ok(leases) => leases,
             Err(err) => {
                 errors.push(format!("registry: {}", err));
@@ -118,23 +119,6 @@ fn daemon_status() -> Result<String> {
     }
 }
 
-fn load_active_leases() -> Result<Vec<Lease>> {
-    let registry_path = paths::registry_path()?;
-    if !registry_path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let registry = Registry::load(&registry_path)?;
-    let mut leases: Vec<Lease> = registry
-        .list(None)
-        .into_iter()
-        .filter(|lease| matches!(lease.state, LeaseState::Pending | LeaseState::Active))
-        .cloned()
-        .collect();
-    leases.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.service_name.cmp(&b.service_name)));
-    Ok(leases)
-}
-
 fn draw_dashboard(frame: &mut ratatui::Frame<'_>, snapshot: &DashboardSnapshot) {
     let areas = Layout::vertical([
         Constraint::Length(5),
@@ -145,7 +129,10 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, snapshot: &DashboardSnapshot) 
 
     let mut header_lines = vec![
         Line::from(vec![
-            Span::styled("Portus Dashboard", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Portus Dashboard",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  q: quit  r: refresh"),
         ]),
         Line::from(format!("Daemon: {}", snapshot.daemon_status)),
@@ -183,7 +170,12 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, snapshot: &DashboardSnapshot) 
                     Cell::from(lease.port.to_string()),
                     Cell::from(format!("{:?}", lease.state).to_lowercase()),
                     Cell::from(lease.service_name.clone()),
-                    Cell::from(lease.client_pid.map(|pid| pid.to_string()).unwrap_or_else(|| "-".into())),
+                    Cell::from(
+                        lease
+                            .client_pid
+                            .map(|pid| pid.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                    ),
                     Cell::from(shorten(&lease.project_path, 36)),
                 ])
             })
@@ -200,8 +192,15 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, snapshot: &DashboardSnapshot) 
             Constraint::Min(20),
         ],
     )
-    .header(Row::new(vec!["Port", "State", "Service", "PID", "Project"]).style(Style::default().add_modifier(Modifier::BOLD)))
-    .block(Block::default().title("Managed Leases").borders(Borders::ALL));
+    .header(
+        Row::new(vec!["Port", "State", "Service", "PID", "Project"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(
+        Block::default()
+            .title("Managed Leases")
+            .borders(Borders::ALL),
+    );
     frame.render_widget(lease_table, areas[1]);
 
     let listener_rows: Vec<Row<'static>> = if snapshot.listeners.is_empty() {
@@ -236,8 +235,15 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, snapshot: &DashboardSnapshot) 
             Constraint::Min(20),
         ],
     )
-    .header(Row::new(vec!["Port", "PID", "Proto", "Command"]).style(Style::default().add_modifier(Modifier::BOLD)))
-    .block(Block::default().title("System Listeners").borders(Borders::ALL));
+    .header(
+        Row::new(vec!["Port", "PID", "Proto", "Command"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(
+        Block::default()
+            .title("System Listeners")
+            .borders(Borders::ALL),
+    );
     frame.render_widget(listener_table, areas[2]);
 }
 

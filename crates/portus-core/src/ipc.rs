@@ -31,6 +31,7 @@ fn socket_name(path: &Path) -> Result<interprocess::local_socket::Name<'static>>
         .map(|name| name.into_owned())
 }
 
+/// Bind a local socket listener at the given path.
 pub fn bind(path: &Path) -> Result<Listener> {
     let name = socket_name(path)?;
     let options = ListenerOptions::new().name(name);
@@ -47,6 +48,7 @@ pub fn bind(path: &Path) -> Result<Listener> {
         .context("failed to bind local socket listener")
 }
 
+/// Connect to a local socket listener at the given path.
 pub async fn connect(path: &Path) -> Result<Stream> {
     let name = socket_name(path)?;
     ConnectOptions::new()
