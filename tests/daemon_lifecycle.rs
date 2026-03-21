@@ -268,6 +268,114 @@ async fn full_lifecycle() -> Result<()> {
 }
 
 #[tokio::test]
+async fn auto_reassign_integration() -> Result<()> {
+    let mut daemon = DaemonHarness::start().await?;
+    let stream = daemon.connect().await?;
+    let (mut reader, mut writer) = stream.split();
+
+    // Service A: allocate port 9900 with auto_reassign=false → expect exactly 9900
+    let resp_a = send_request(
+        &mut reader,
+        &mut writer,
+        Request::Allocate {
+            project: "/tmp/portus/auto_reassign".into(),
+            service: "service-a".into(),
+            preferred_port: Some(9900),
+            protocol: Protocol::Tcp,
+            auto_reassign: false,
+            pid: Some(std::process::id()),
+        },
+    )
+    .await?;
+    let lease_a = match resp_a {
+        Response::Allocated { lease } => {
+            assert_eq!(lease.port, 9900, "service A should get exactly port 9900");
+            lease
+        }
+        other => bail!("expected allocated for service A, got {other:?}"),
+    };
+
+    // Service B: allocate port 9900 with auto_reassign=true → expect port ≥ 10000
+    let resp_b = send_request(
+        &mut reader,
+        &mut writer,
+        Request::Allocate {
+            project: "/tmp/portus/auto_reassign".into(),
+            service: "service-b".into(),
+            preferred_port: Some(9900),
+            protocol: Protocol::Tcp,
+            auto_reassign: true,
+            pid: Some(std::process::id()),
+        },
+    )
+    .await?;
+    let lease_b = match resp_b {
+        Response::Allocated { lease } => {
+            assert!(
+                lease.port >= 10000,
+                "service B should be reassigned to auto range (≥10000), got {}",
+                lease.port
+            );
+            lease
+        }
+        other => bail!("expected allocated for service B, got {other:?}"),
+    };
+
+    // Service C: allocate port 9900 with auto_reassign=false → expect Error
+    let resp_c = send_request(
+        &mut reader,
+        &mut writer,
+        Request::Allocate {
+            project: "/tmp/portus/auto_reassign".into(),
+            service: "service-c".into(),
+            preferred_port: Some(9900),
+            protocol: Protocol::Tcp,
+            auto_reassign: false,
+            pid: Some(std::process::id()),
+        },
+    )
+    .await?;
+    match resp_c {
+        Response::Error { code, message } => {
+            assert_eq!(code, "allocation_failed");
+            assert!(
+                message.to_lowercase().contains("in use")
+                    || message.to_lowercase().contains("already")
+                    || message.to_lowercase().contains("conflict"),
+                "error message should indicate port conflict, got: {message}"
+            );
+        }
+        other => bail!("expected error for service C, got {other:?}"),
+    }
+
+    send_request(
+        &mut reader,
+        &mut writer,
+        Request::Release {
+            lease_id: lease_a.lease_id.clone(),
+            session_token: lease_a.session_token.clone(),
+        },
+    )
+    .await?;
+    send_request(
+        &mut reader,
+        &mut writer,
+        Request::Release {
+            lease_id: lease_b.lease_id.clone(),
+            session_token: lease_b.session_token.clone(),
+        },
+    )
+    .await?;
+
+    let shutdown = send_request(&mut reader, &mut writer, Request::Shutdown).await?;
+    assert!(matches!(shutdown, Response::ShuttingDown));
+    drop(reader);
+    drop(writer);
+    daemon.wait_for_exit()?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn error_handling() -> Result<()> {
     let mut daemon = DaemonHarness::start().await?;
     let stream = daemon.connect().await?;
