@@ -15,6 +15,8 @@ use crate::port_check;
 const DEFAULT_LEASE_SECS: i64 = 300; // 5 minutes
 /// Default heartbeat extension (seconds).
 const HEARTBEAT_EXTENSION_SECS: i64 = 300;
+/// Grace period for crash recovery: recently-expired Active leases get a second chance (seconds).
+const GRACE_PERIOD_SECS: i64 = 60;
 
 /// In-memory registry of port leases, backed by an optional TOML file.
 #[derive(Debug)]
@@ -36,7 +38,7 @@ impl Registry {
     /// Loads existing data if the file exists.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let leases = if path.exists() {
+        let mut leases = if path.exists() {
             let content = std::fs::read_to_string(&path)
                 .with_context(|| format!("failed to read registry at {}", path.display()))?;
             let file: RegistryFile =
@@ -47,10 +49,34 @@ impl Registry {
             debug!(path = %path.display(), "no existing registry, starting fresh");
             HashMap::new()
         };
-        Ok(Self {
+
+        let now = chrono::Utc::now();
+        let grace = chrono::Duration::seconds(GRACE_PERIOD_SECS);
+        let mut recovered = 0u32;
+        let mut force_expired = 0u32;
+        for lease in leases.values_mut() {
+            if lease.state == LeaseState::Active && now > lease.expires_at {
+                if (now - lease.expires_at) <= grace {
+                    lease.state = LeaseState::Pending;
+                    recovered += 1;
+                } else {
+                    lease.state = LeaseState::Expired;
+                    force_expired += 1;
+                }
+            }
+        }
+        if recovered > 0 || force_expired > 0 {
+            info!(recovered, force_expired, "crash recovery grace applied");
+        }
+
+        let reg = Self {
             leases,
             path: Some(path),
-        })
+        };
+        if recovered > 0 || force_expired > 0 {
+            reg.save()?;
+        }
+        Ok(reg)
     }
 
     /// Create an empty in-memory registry (for testing). Does not persist to disk.
@@ -648,5 +674,67 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("already allocated"));
+    }
+
+    #[test]
+    fn recovery_grace_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-registry.toml");
+
+        let lease_id;
+        {
+            let mut reg = Registry::load(&path).unwrap();
+            let lease = reg
+                .allocate(
+                    "/test/project".into(),
+                    "web".into(),
+                    Some(8080),
+                    Protocol::Tcp,
+                    false,
+                    None,
+                )
+                .unwrap();
+            reg.confirm(&lease.lease_id, &lease.session_token).unwrap();
+            lease_id = lease.lease_id.clone();
+
+            let entry = reg.leases.get_mut(&lease_id).unwrap();
+            entry.expires_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+            reg.save().unwrap();
+        }
+
+        let reg = Registry::load(&path).unwrap();
+        let lease = reg.leases.get(&lease_id).unwrap();
+        assert_eq!(lease.state, LeaseState::Pending);
+    }
+
+    #[test]
+    fn recovery_beyond_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-registry.toml");
+
+        let lease_id;
+        {
+            let mut reg = Registry::load(&path).unwrap();
+            let lease = reg
+                .allocate(
+                    "/test/project".into(),
+                    "api".into(),
+                    Some(9090),
+                    Protocol::Tcp,
+                    false,
+                    None,
+                )
+                .unwrap();
+            reg.confirm(&lease.lease_id, &lease.session_token).unwrap();
+            lease_id = lease.lease_id.clone();
+
+            let entry = reg.leases.get_mut(&lease_id).unwrap();
+            entry.expires_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+            reg.save().unwrap();
+        }
+
+        let reg = Registry::load(&path).unwrap();
+        let lease = reg.leases.get(&lease_id).unwrap();
+        assert_eq!(lease.state, LeaseState::Expired);
     }
 }
