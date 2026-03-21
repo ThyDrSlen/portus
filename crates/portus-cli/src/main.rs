@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use portus_core::model::{Lease, LeaseState, Protocol};
 use portus_core::protocol::{Request, Response};
 use portus_core::registry::Registry;
+use portus_core::port_check;
 use portus_core::scan::{kill_processes_on_port, scan_ports};
 use portus_core::{ipc, paths, transport};
 use serde::Serialize;
@@ -42,6 +43,9 @@ enum Commands {
         /// Reassign automatically if the preferred port is unavailable
         #[arg(long)]
         auto_reassign: bool,
+        /// Check availability without allocating
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Confirm a port allocation (client bound successfully)
     Confirm {
@@ -51,6 +55,9 @@ enum Commands {
         /// Session token
         #[arg(long)]
         token: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Release a port allocation
     Release {
@@ -60,6 +67,9 @@ enum Commands {
         /// Session token
         #[arg(long)]
         token: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// List active port allocations
     List {
@@ -71,7 +81,11 @@ enum Commands {
         json: bool,
     },
     /// Show daemon status
-    Status,
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Scan listening ports and show managed matches
     Scan {
         /// Filter to a single port
@@ -92,6 +106,9 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Show what would be killed without sending signal
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Interactive dashboard for daemon, leases, and listeners
     Dashboard,
@@ -118,6 +135,9 @@ enum Commands {
     },
     /// Manage the portus daemon
     Daemon {
+        /// Output as JSON (applies to `status` subcommand)
+        #[arg(long)]
+        json: bool,
         #[command(subcommand)]
         action: DaemonAction,
     },
@@ -164,6 +184,7 @@ async fn main() -> Result<()> {
             port,
             json,
             auto_reassign,
+            dry_run: _,
         } => {
             let project = resolve_project(project)?;
             let requested_port = port;
@@ -199,13 +220,13 @@ async fn main() -> Result<()> {
                     }
                 }
                 Response::Error { code, message } => {
-                    bail!("[{}] {}", code, message);
+                    bail!("{}", format_daemon_error(&code, &message));
                 }
                 other => bail!("unexpected response: {:?}", other),
             }
         }
 
-        Commands::Confirm { lease_id, token } => {
+        Commands::Confirm { lease_id, token, json } => {
             let response = send_request(Request::Confirm {
                 lease_id: lease_id.clone(),
                 session_token: token,
@@ -213,14 +234,18 @@ async fn main() -> Result<()> {
             .await?;
             match response {
                 Response::Confirmed { lease_id } => {
-                    println!("✓ Lease {} confirmed", lease_id);
+                    if json {
+                        println!("{}", serde_json::json!({"confirmed": true, "lease_id": lease_id}));
+                    } else {
+                        println!("✓ Lease {} confirmed", lease_id);
+                    }
                 }
-                Response::Error { code, message } => bail!("[{}] {}", code, message),
+                Response::Error { code, message } => bail!("{}", format_daemon_error(&code, &message)),
                 other => bail!("unexpected response: {:?}", other),
             }
         }
 
-        Commands::Release { lease_id, token } => {
+        Commands::Release { lease_id, token, json } => {
             let response = send_request(Request::Release {
                 lease_id: lease_id.clone(),
                 session_token: token,
@@ -228,9 +253,13 @@ async fn main() -> Result<()> {
             .await?;
             match response {
                 Response::Released { lease_id } => {
-                    println!("✓ Lease {} released", lease_id);
+                    if json {
+                        println!("{}", serde_json::json!({"released": true, "lease_id": lease_id}));
+                    } else {
+                        println!("✓ Lease {} released", lease_id);
+                    }
                 }
-                Response::Error { code, message } => bail!("[{}] {}", code, message),
+                Response::Error { code, message } => bail!("{}", format_daemon_error(&code, &message)),
                 other => bail!("unexpected response: {:?}", other),
             }
         }
@@ -268,12 +297,12 @@ async fn main() -> Result<()> {
 {} allocation(s)", leases.len());
                     }
                 }
-                Response::Error { code, message } => bail!("[{}] {}", code, message),
+                Response::Error { code, message } => bail!("{}", format_daemon_error(&code, &message)),
                 other => bail!("unexpected response: {:?}", other),
             }
         }
 
-        Commands::Status => {
+        Commands::Status { json } => {
             let response = send_request(Request::Status).await?;
             match response {
                 Response::DaemonStatus {
@@ -282,13 +311,22 @@ async fn main() -> Result<()> {
                     active_leases,
                     socket_path,
                 } => {
-                    println!("Portus Daemon");
-                    println!("  PID:           {}", pid);
-                    println!("  Uptime:        {}s", uptime_secs);
-                    println!("  Active leases: {}", active_leases);
-                    println!("  Socket:        {}", socket_path);
+                    if json {
+                        println!("{}", serde_json::json!({
+                            "pid": pid,
+                            "uptime_secs": uptime_secs,
+                            "active_leases": active_leases,
+                            "socket_path": socket_path,
+                        }));
+                    } else {
+                        println!("Portus Daemon");
+                        println!("  PID:           {}", pid);
+                        println!("  Uptime:        {}s", uptime_secs);
+                        println!("  Active leases: {}", active_leases);
+                        println!("  Socket:        {}", socket_path);
+                    }
                 }
-                Response::Error { code, message } => bail!("[{}] {}", code, message),
+                Response::Error { code, message } => bail!("{}", format_daemon_error(&code, &message)),
                 other => bail!("unexpected response: {:?}", other),
             }
         }
@@ -326,7 +364,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Kill { port, signal, json } => {
+        Commands::Kill { port, signal, json, dry_run: _ } => {
             let signal = parse_signal(&signal)?;
             let rows = build_scan_rows(Some(port))?;
             if rows.is_empty() {
@@ -382,7 +420,7 @@ async fn main() -> Result<()> {
 
             let lease = match response {
                 Response::Allocated { lease } => lease,
-                Response::Error { code, message } => bail!("[{}] {}", code, message),
+                Response::Error { code, message } => bail!("{}", format_daemon_error(&code, &message)),
                 other => bail!("unexpected response: {:?}", other),
             };
 
@@ -484,7 +522,7 @@ async fn main() -> Result<()> {
             std::process::exit(exit_code);
         }
 
-        Commands::Daemon { action } => match action {
+        Commands::Daemon { action, json } => match action {
             DaemonAction::Start => {
                 let socket_path = paths::socket_path()?;
                 if try_connect(&socket_path).await {
@@ -503,8 +541,15 @@ async fn main() -> Result<()> {
             }
             DaemonAction::Status => {
                 let socket_path = paths::socket_path()?;
+                let not_running = || {
+                    if json {
+                        println!("{}", serde_json::json!({"running": false}));
+                    } else {
+                        println!("✗ Daemon is not running");
+                    }
+                };
                 if !try_connect(&socket_path).await {
-                    println!("✗ Daemon is not running");
+                    not_running();
                 } else {
                     match ipc::connect(&socket_path).await {
                         Ok(stream) => match send_on_stream(stream, Request::Status).await {
@@ -512,16 +557,26 @@ async fn main() -> Result<()> {
                                 pid,
                                 uptime_secs,
                                 active_leases,
-                                ..
+                                socket_path,
                             }) => {
-                                println!(
-                                    "✓ Daemon running (PID {}, uptime {}s, {} active leases)",
-                                    pid, uptime_secs, active_leases
-                                );
+                                if json {
+                                    println!("{}", serde_json::json!({
+                                        "running": true,
+                                        "pid": pid,
+                                        "uptime_secs": uptime_secs,
+                                        "active_leases": active_leases,
+                                        "socket_path": socket_path,
+                                    }));
+                                } else {
+                                    println!(
+                                        "✓ Daemon running (PID {}, uptime {}s, {} active leases)",
+                                        pid, uptime_secs, active_leases
+                                    );
+                                }
                             }
-                            _ => println!("✗ Daemon is not running"),
+                            _ => not_running(),
                         },
-                        Err(_) => println!("✗ Daemon is not running"),
+                        Err(_) => not_running(),
                     }
                 }
             }
@@ -691,6 +746,56 @@ async fn start_daemon() -> Result<()> {
         .with_context(|| format!("failed to start daemon: {}", daemon_bin.display()))?;
 
     Ok(())
+}
+
+/// Strips the `[code]` prefix and appends actionable suggestions based on error content.
+fn format_daemon_error(code: &str, message: &str) -> String {
+    let suggestion = if message.contains("already allocated") {
+        let port_hint = extract_port_from_message(message)
+            .map(|p| format!(" --port {}", p))
+            .unwrap_or_default();
+        format!(
+            "\n  Try: portus release --lease-id <id> --token <token>\n       portus list{} to find the existing lease\n       or use --auto-reassign to pick another port",
+            port_hint,
+        )
+    } else if message.contains("in use by another process") {
+        let port_hint = extract_port_from_message(message)
+            .map(|p| format!(" --port {}", p))
+            .unwrap_or_default();
+        format!(
+            "\n  Try: portus kill{} to terminate the blocking process\n       or use --auto-reassign to pick another port",
+            port_hint,
+        )
+    } else if message.contains("invalid") && message.contains("token") {
+        "\n  Try: portus list --json to find the correct lease-id and token".to_string()
+    } else if message.contains("not found")
+        && (code == "confirm_failed" || code == "release_failed" || code == "heartbeat_failed")
+    {
+        "\n  Try: portus list to see active leases".to_string()
+    } else {
+        String::new()
+    };
+
+    let display_msg = uppercase_first(message);
+    format!("{}{}", display_msg, suggestion)
+}
+
+fn extract_port_from_message(message: &str) -> Option<u16> {
+    let idx = message.find("port ")?;
+    let after = idx + 5;
+    let end = message[after..]
+        .find(|c: char| !c.is_ascii_digit())
+        .map(|i| after + i)
+        .unwrap_or(message.len());
+    message[after..end].parse().ok()
+}
+
+fn uppercase_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 fn which_portusd() -> Option<std::path::PathBuf> {
