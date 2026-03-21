@@ -1,0 +1,23 @@
+[package]
+name = "portus-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for Portus port allocation daemon"
+
+[[bin]]
+name = "portus"
+path = "src/main.rs"
+
+[dependencies]
+portus-core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+interprocess = { workspace = true }

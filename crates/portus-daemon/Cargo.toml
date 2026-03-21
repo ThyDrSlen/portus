@@ -1,0 +1,19 @@
+[package]
+name = "portus-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Background daemon for Portus port allocation"
+
+[[bin]]
+name = "portusd"
+path = "src/main.rs"
+
+[dependencies]
+portus-core = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+interprocess = { workspace = true }
