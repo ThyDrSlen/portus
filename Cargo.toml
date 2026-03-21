@@ -1,3 +1,10 @@
+[package]
+name = "portus-workspace-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
 [workspace]
 members = ["crates/portus-core", "crates/portus-daemon", "crates/portus-cli"]
 resolver = "2"
@@ -24,3 +31,10 @@ crossterm = "0.28"
 ratatui = "0.29"
 interprocess = { version = "2", features = ["tokio"] }
 widestring = "1"
+
+[dev-dependencies]
+anyhow = { workspace = true }
+interprocess = { workspace = true }
+portus-core = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
