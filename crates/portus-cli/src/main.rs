@@ -232,8 +232,10 @@ async fn main() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&obj)?);
                 } else if available {
                     println!("Port {} is available", port);
+                } else if let Some(reason) = reason {
+                    println!("Port {} is not available: {}", port, reason);
                 } else {
-                    println!("Port {} is not available: {}", port, reason.unwrap());
+                    println!("Port {} is not available", port);
                 }
             } else {
                 let project = resolve_project(project)?;
@@ -794,7 +796,9 @@ async fn start_daemon() -> Result<()> {
 
     let daemon_bin = {
         let self_path = std::env::current_exe().context("cannot find self path")?;
-        let dir = self_path.parent().unwrap();
+        let dir = self_path
+            .parent()
+            .with_context(|| format!("cannot determine binary directory for {}", self_path.display()))?;
         let candidate = dir.join("portusd");
         if candidate.exists() {
             candidate
@@ -816,13 +820,7 @@ async fn start_daemon() -> Result<()> {
 /// Strips the `[code]` prefix and appends actionable suggestions based on error content.
 pub(crate) fn format_daemon_error(code: &str, message: &str) -> String {
     let suggestion = if message.contains("already allocated") {
-        let port_hint = extract_port_from_message(message)
-            .map(|p| format!(" --port {}", p))
-            .unwrap_or_default();
-        format!(
-            "\n  Try: portus release --lease-id <id> --token <token>\n       portus list{} to find the existing lease\n       or use --auto-reassign to pick another port",
-            port_hint,
-        )
+        "\n  Try: portus release --lease-id <id> --token <token>\n       portus list to find the existing lease\n       or use --auto-reassign to pick another port".to_string()
     } else if message.contains("in use by another process") {
         let port_hint = extract_port_from_message(message)
             .map(|p| format!(" --port {}", p))

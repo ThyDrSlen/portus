@@ -17,6 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Terminal;
 
+/// Interactive TUI dashboard for monitoring ports and leases.
 pub fn run_dashboard() -> Result<()> {
     if !io::stdout().is_terminal() {
         bail!("dashboard requires an interactive terminal");

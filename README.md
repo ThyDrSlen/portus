@@ -90,7 +90,7 @@ The agent calls `allocate_port` before starting a server, gets back a port numbe
 - **Process killing** (`portus kill --port 3000`) with `--dry-run` preview
 - **`portus run` wrapper** that allocates, injects `$PORT`, confirms on bind, and releases on exit
 - **Signal-safe cleanup**: SIGTERM and SIGINT both trigger lease release before exit
-- **JSON output** on every command via `--json`
+- **JSON output** on most non-interactive commands via `--json`
 - **`--dry-run`** on `request` and `kill` for safe previews
 - **Auto-start**: daemon starts automatically on first CLI use, no service manager needed
 - **Cross-platform**: macOS, Linux, and Windows (via `interprocess`)
@@ -113,7 +113,7 @@ The agent calls `allocate_port` before starting a server, gets back a port numbe
 | `portus daemon start\|stop\|status` | Manage the daemon directly |
 | `portus mcp serve` | Start the MCP server for AI agent integration |
 
-All commands accept `--json` for machine-readable output.
+Most non-interactive commands accept `--json` for machine-readable output.
 
 ---
 

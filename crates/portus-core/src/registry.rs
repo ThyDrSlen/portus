@@ -252,16 +252,26 @@ impl Registry {
         let mut expired_count = 0;
         let ids: Vec<String> = self.leases.keys().cloned().collect();
         for id in ids {
-            let lease = self.leases.get(&id).unwrap();
-            if matches!(lease.state, LeaseState::Pending | LeaseState::Active) && lease.is_expired()
-            {
+            let should_expire = {
+                let lease = self
+                    .leases
+                    .get(&id)
+                    .with_context(|| format!("lease {id} disappeared during stale expiry check"))?;
+                matches!(lease.state, LeaseState::Pending | LeaseState::Active)
+                    && lease.is_expired()
+            };
+            if should_expire {
+                let lease = self
+                    .leases
+                    .get_mut(&id)
+                    .with_context(|| format!("lease {id} disappeared before stale expiry"))?;
                 warn!(
                     lease_id = %id,
                     port = lease.port,
                     service = %lease.service_name,
                     "expiring stale lease"
                 );
-                self.leases.get_mut(&id).unwrap().expire();
+                lease.expire();
                 expired_count += 1;
             }
         }
@@ -283,11 +293,14 @@ impl Registry {
                 continue;
             };
             let should_expire = matches!(lease.state, LeaseState::Pending | LeaseState::Active)
-                && lease.client_pid.is_some()
-                && !pid_is_alive(lease.client_pid.unwrap());
+                && lease.client_pid.is_some_and(|pid| !pid_is_alive(pid));
             if should_expire {
+                let lease = self
+                    .leases
+                    .get_mut(&id)
+                    .with_context(|| format!("lease {id} disappeared before dead-client expiry"))?;
                 warn!(lease_id = %id, port = lease.port, service = %lease.service_name, "expiring dead client lease");
-                self.leases.get_mut(&id).unwrap().expire();
+                lease.expire();
                 expired_count += 1;
             }
         }
