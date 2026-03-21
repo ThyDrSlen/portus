@@ -1,4 +1,5 @@
 mod dashboard;
+mod mcp;
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -133,6 +134,10 @@ enum Commands {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// Manage the portus daemon
     Daemon {
         /// Output as JSON (applies to `status` subcommand)
@@ -151,6 +156,11 @@ enum DaemonAction {
     Stop,
     /// Show daemon status
     Status,
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    Serve,
 }
 
 #[derive(Debug, Serialize)]
@@ -586,6 +596,12 @@ async fn main() -> Result<()> {
             std::process::exit(exit_code);
         }
 
+        Commands::Mcp { action } => match action {
+            McpAction::Serve => {
+                mcp::serve_stdio().await?;
+            }
+        },
+
         Commands::Daemon { action, json } => match action {
             DaemonAction::Start => {
                 let socket_path = paths::socket_path()?;
@@ -650,7 +666,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn resolve_project(project: Option<String>) -> Result<String> {
+pub(crate) fn resolve_project(project: Option<String>) -> Result<String> {
     match project {
         Some(p) => Ok(p),
         None => {
@@ -758,7 +774,7 @@ async fn try_connect(socket_path: &std::path::Path) -> bool {
     ipc::connect(socket_path).await.is_ok()
 }
 
-async fn send_request(request: Request) -> Result<Response> {
+pub(crate) async fn send_request(request: Request) -> Result<Response> {
     let socket_path = paths::socket_path()?;
 
     let stream = match ipc::connect(&socket_path).await {
@@ -813,7 +829,7 @@ async fn start_daemon() -> Result<()> {
 }
 
 /// Strips the `[code]` prefix and appends actionable suggestions based on error content.
-fn format_daemon_error(code: &str, message: &str) -> String {
+pub(crate) fn format_daemon_error(code: &str, message: &str) -> String {
     let suggestion = if message.contains("already allocated") {
         let port_hint = extract_port_from_message(message)
             .map(|p| format!(" --port {}", p))
