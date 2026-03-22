@@ -38,7 +38,7 @@ impl Default for PortusServer {
 impl ServerHandler for PortusServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Allocate and manage local development ports with Portus")
+            .with_instructions("Portus prevents port collisions between dev servers and AI coding agents. Use allocate_port before starting any server, release_port when done. The daemon auto-starts on first use.")
     }
 }
 
@@ -160,7 +160,7 @@ struct DaemonStatusResult {
 
 #[tool_router(router = tool_router)]
 impl PortusServer {
-    #[tool(description = "Allocate a managed TCP port for a service")]
+    #[tool(description = "Reserve a TCP port for a service before starting a dev server. Returns a lease with port number, lease_id, and token. If the preferred port is taken, set auto_reassign=true to get the next available port. The daemon auto-starts on first call.")]
     async fn allocate_port(
         &self,
         Parameters(params): Parameters<AllocatePortParams>,
@@ -189,7 +189,7 @@ impl PortusServer {
         }
     }
 
-    #[tool(description = "Release a managed TCP port lease")]
+    #[tool(description = "Release a previously allocated port lease. Requires the lease_id and token from allocate_port. Call this when stopping a dev server to free the port for other services.")]
     async fn release_port(
         &self,
         Parameters(params): Parameters<ReleasePortParams>,
@@ -211,7 +211,7 @@ impl PortusServer {
         }
     }
 
-    #[tool(description = "List active managed port leases", annotations(read_only_hint = true))]
+    #[tool(description = "List all active port allocations across all services and projects. Use the project filter to scope results to a specific project directory. Returns lease details including port, service name, state, and expiry.", annotations(read_only_hint = true))]
     async fn list_ports(
         &self,
         Parameters(params): Parameters<ListPortsParams>,
@@ -233,7 +233,7 @@ impl PortusServer {
         }
     }
 
-    #[tool(description = "Check whether a TCP port is available", annotations(read_only_hint = true))]
+    #[tool(description = "Check if a specific TCP port is available for use. Returns availability status and, if taken, details about which service holds the lease. Use this before allocate_port to preview availability without reserving.", annotations(read_only_hint = true))]
     async fn check_port(
         &self,
         Parameters(params): Parameters<CheckPortParams>,
@@ -281,7 +281,7 @@ impl PortusServer {
         }))
     }
 
-    #[tool(description = "Show Portus daemon status", annotations(read_only_hint = true))]
+    #[tool(description = "Check if the Portus daemon is running and healthy. Returns PID, uptime, and count of active leases. The daemon auto-starts on first tool call, so this is mainly for diagnostics.", annotations(read_only_hint = true))]
     async fn daemon_status(&self) -> Result<Json<DaemonStatusResult>, String> {
         let response = crate::send_request(Request::Status)
             .await
