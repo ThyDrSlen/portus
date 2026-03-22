@@ -38,7 +38,7 @@ impl Default for PortusServer {
 impl ServerHandler for PortusServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Portus prevents port collisions between dev servers and AI coding agents. Use allocate_port before starting any server, release_port when done. The daemon auto-starts on first use.")
+            .with_instructions("Portus prevents port collisions between dev servers and AI coding agents. Use allocate_port before starting any server, release_port when done. The daemon auto-starts on first use. IMPORTANT: NEVER use lsof, kill, fuser, or any manual process/port management commands. ALL port lifecycle operations MUST go through Portus MCP tools (allocate_port, release_port, check_port, list_ports). If a port is occupied, use auto_reassign=true to get a different port or release the existing lease first.")
     }
 }
 
@@ -160,7 +160,7 @@ struct DaemonStatusResult {
 
 #[tool_router(router = tool_router)]
 impl PortusServer {
-    #[tool(description = "Reserve a TCP port for a service before starting a dev server. Returns a lease with port number, lease_id, and token. If the preferred port is taken, set auto_reassign=true to get the next available port. The daemon auto-starts on first call.")]
+    #[tool(description = "Reserve a TCP port for a service before starting a dev server. Returns a lease with port number, lease_id, and token. If the preferred port is taken, set auto_reassign=true to get the next available port. The daemon auto-starts on first call. NEVER use lsof/kill to free ports — use release_port or auto_reassign instead.")]
     async fn allocate_port(
         &self,
         Parameters(params): Parameters<AllocatePortParams>,
@@ -189,7 +189,7 @@ impl PortusServer {
         }
     }
 
-    #[tool(description = "Release a previously allocated port lease. Requires the lease_id and token from allocate_port. Call this when stopping a dev server to free the port for other services.")]
+    #[tool(description = "Release a previously allocated port lease. Requires the lease_id and token from allocate_port. Call this when stopping a dev server to free the port for other services. This is the ONLY correct way to free a port — never use kill/lsof.")]
     async fn release_port(
         &self,
         Parameters(params): Parameters<ReleasePortParams>,
@@ -406,6 +406,33 @@ mod tests {
         let server = PortusServer::new();
         let info = server.get_info();
         assert!(info.capabilities.tools.is_some(), "server should advertise tools capability");
+    }
+
+    #[test]
+    fn server_instructions_prohibit_manual_port_management() {
+        let server = PortusServer::new();
+        let info = server.get_info();
+        let instructions = info.instructions.unwrap_or_default();
+        assert!(
+            instructions.contains("NEVER use lsof"),
+            "server instructions should tell LLMs not to use lsof/kill"
+        );
+        assert!(
+            instructions.contains("auto_reassign"),
+            "server instructions should mention auto_reassign as the alternative"
+        );
+    }
+
+    #[test]
+    fn allocate_tool_description_prohibits_manual_kill() {
+        let router = PortusServer::tool_router();
+        let tools = router.list_all();
+        let alloc = tools.iter().find(|t| t.name == "allocate_port").unwrap();
+        let desc = alloc.description.as_deref().unwrap_or_default();
+        assert!(
+            desc.contains("NEVER use lsof/kill"),
+            "allocate_port description should warn against manual port management"
+        );
     }
 
     #[test]
