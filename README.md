@@ -3,6 +3,7 @@
 **Port collision prevention daemon for developers and AI coding agents.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/ThyDrSlen/portus/actions/workflows/ci.yml/badge.svg)](https://github.com/ThyDrSlen/portus/actions/workflows/ci.yml)
 
 ---
 
@@ -30,7 +31,10 @@ portus request --service web --port 3000
 ## Quick Start
 
 ```bash
-# Install from source
+# Install from GitHub
+cargo install --git https://github.com/ThyDrSlen/portus.git portus-cli
+
+# Or install from a local clone
 cargo install --path crates/portus-cli
 
 # Request a port (daemon auto-starts on first use)
@@ -44,6 +48,32 @@ portus list
 
 # Interactive dashboard
 portus dashboard
+```
+
+---
+
+## Dashboard
+
+Monitor all allocations and system listeners in real-time.
+
+```
+┌Status─────────────────────────────────────────────────────────────────────────┐
+│ Portus Dashboard  q: quit  r: refresh                                        │
+│ Daemon: running (pid 2185)                                                   │
+│ Registry: ~/.config/portus/registry.toml  Active leases: 3  Listeners: 15   │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌Managed Leases─────────────────────────────────────────────────────────────────┐
+│ Port     State        Service            PID        Project                   │
+│ 3000     pending      next-frontend      2184       ~/Projects/my-app        │
+│ 8080     pending      api-server         2186       ~/Projects/my-app        │
+│ 10000    pending      postgres           2234       ~/Projects/my-app        │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌System Listeners───────────────────────────────────────────────────────────────┐
+│ Port     PID        Proto      Command                                       │
+│ 5432     1025       tcp        postgres                                      │
+│ 6379     1010       tcp        redis-server                                  │
+│ 4096     12322      tcp        opencode                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -65,7 +95,21 @@ This is the primary reason Portus exists. Add it to your MCP config and every AI
 }
 ```
 
-**Cursor / other MCP clients**: same config, different config file location per client.
+**OpenCode** (`~/.config/opencode/opencode.json`):
+
+```json
+{
+  "mcp": {
+    "portus": {
+      "type": "local",
+      "command": ["portus", "mcp", "serve"],
+      "enabled": true
+    }
+  }
+}
+```
+
+**Cursor / other MCP clients**: same pattern, different config file location per client.
 
 Once connected, the agent has access to five tools:
 
