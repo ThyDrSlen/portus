@@ -2,6 +2,7 @@ use std::io::{self, IsTerminal};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -14,7 +15,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Terminal;
 
 // ── Typed view-state helpers ────────────────────────────────────────────
@@ -143,6 +144,113 @@ impl ListenerOwnership {
     }
 }
 
+// ── Pane focus ──────────────────────────────────────────────────────────
+
+/// Which table pane currently holds keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusedPane {
+    Leases,
+    Listeners,
+}
+
+impl FocusedPane {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Leases => Self::Listeners,
+            Self::Listeners => Self::Leases,
+        }
+    }
+}
+
+// ── Dashboard state (UI + data) ─────────────────────────────────────────
+
+/// Mutable UI state that lives across frames — scroll positions, focus, data.
+struct DashboardState {
+    snapshot: DashboardSnapshot,
+    lease_table: TableState,
+    listener_table: TableState,
+    focused: FocusedPane,
+}
+
+impl DashboardState {
+    fn new() -> Self {
+        let snapshot = DashboardSnapshot::load();
+        let mut state = Self {
+            snapshot,
+            lease_table: TableState::default(),
+            listener_table: TableState::default(),
+            focused: FocusedPane::Leases,
+        };
+        state.init_selections();
+        state
+    }
+
+    fn refresh(&mut self) {
+        self.snapshot = DashboardSnapshot::load();
+        self.clamp_selections();
+    }
+
+    /// Select the first row in each table that has data.
+    fn init_selections(&mut self) {
+        if !self.snapshot.leases.is_empty() {
+            self.lease_table.select(Some(0));
+        }
+        if !self.snapshot.listeners.is_empty() {
+            self.listener_table.select(Some(0));
+        }
+    }
+
+    /// After a data refresh, ensure scroll positions don't exceed row counts.
+    fn clamp_selections(&mut self) {
+        clamp_table_selection(&mut self.lease_table, self.snapshot.leases.len());
+        clamp_table_selection(&mut self.listener_table, self.snapshot.listeners.len());
+    }
+
+    fn scroll_up(&mut self) {
+        let (table, _count) = self.focused_table_mut();
+        let i = table.selected().unwrap_or(0).saturating_sub(1);
+        table.select(Some(i));
+    }
+
+    fn scroll_down(&mut self) {
+        let (table, count) = self.focused_table_mut();
+        if count == 0 {
+            return;
+        }
+        let next = table
+            .selected()
+            .map(|i| (i + 1).min(count - 1))
+            .unwrap_or(0);
+        table.select(Some(next));
+    }
+
+    fn toggle_focus(&mut self) {
+        self.focused = self.focused.toggle();
+        // Ensure newly focused table has a selection if it has rows.
+        let (table, count) = self.focused_table_mut();
+        if table.selected().is_none() && count > 0 {
+            table.select(Some(0));
+        }
+    }
+
+    fn focused_table_mut(&mut self) -> (&mut TableState, usize) {
+        match self.focused {
+            FocusedPane::Leases => (&mut self.lease_table, self.snapshot.leases.len()),
+            FocusedPane::Listeners => (&mut self.listener_table, self.snapshot.listeners.len()),
+        }
+    }
+}
+
+fn clamp_table_selection(state: &mut TableState, row_count: usize) {
+    if let Some(sel) = state.selected() {
+        if row_count == 0 {
+            state.select(None);
+        } else if sel >= row_count {
+            state.select(Some(row_count - 1));
+        }
+    }
+}
+
 // ── Dashboard entry point (unchanged interface) ─────────────────────────
 
 /// Interactive TUI dashboard for monitoring ports and leases.
@@ -159,20 +267,23 @@ pub fn run_dashboard() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
-    let mut snapshot = DashboardSnapshot::load();
+    let mut state = DashboardState::new();
     loop {
-        terminal.draw(|frame| draw_dashboard(frame, &snapshot))?;
+        terminal.draw(|frame| draw_dashboard(frame, &mut state))?;
 
         if event::poll(Duration::from_secs(1)).context("failed to poll terminal events")? {
             if let Event::Key(key) = event::read().context("failed to read terminal event")? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('r') => snapshot = DashboardSnapshot::load(),
+                    KeyCode::Char('r') => state.refresh(),
+                    KeyCode::Up | KeyCode::Char('k') => state.scroll_up(),
+                    KeyCode::Down | KeyCode::Char('j') => state.scroll_down(),
+                    KeyCode::Tab => state.toggle_focus(),
                     _ => {}
                 }
             }
         } else {
-            snapshot = DashboardSnapshot::load();
+            state.refresh();
         }
     }
 
@@ -195,16 +306,12 @@ struct DashboardSnapshot {
     daemon_probe: std::result::Result<DaemonProbe, String>,
     leases: Vec<Lease>,
     listeners: Vec<PortProcess>,
-    registry_path: String,
+    last_refreshed_at: DateTime<Utc>,
     error: Option<String>,
 }
 
 impl DashboardSnapshot {
     fn load() -> Self {
-        let registry_path = paths::registry_path()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|err| format!("unavailable ({})", err));
-
         let daemon_probe = probe_daemon().map_err(|err| format!("{}", err));
 
         let mut errors = Vec::new();
@@ -228,7 +335,7 @@ impl DashboardSnapshot {
             daemon_probe,
             leases,
             listeners,
-            registry_path,
+            last_refreshed_at: Utc::now(),
             error: (!errors.is_empty()).then(|| errors.join(" | ")),
         }
     }
@@ -258,17 +365,31 @@ fn probe_daemon() -> Result<DaemonProbe> {
 
 // ── Drawing ─────────────────────────────────────────────────────────────
 
-fn draw_dashboard(frame: &mut ratatui::Frame<'_>, snapshot: &DashboardSnapshot) {
+fn draw_dashboard(frame: &mut ratatui::Frame<'_>, state: &mut DashboardState) {
     let areas = Layout::vertical([
-        Constraint::Length(6),
-        Constraint::Min(8),
-        Constraint::Min(8),
+        Constraint::Length(5), // Status (compacted — registry path removed)
+        Constraint::Min(8),    // Managed Leases
+        Constraint::Min(8),    // System Listeners
+        Constraint::Length(1), // Keyboard-help footer
     ])
     .split(frame.area());
 
-    draw_status_pane(frame, snapshot, areas[0]);
-    draw_lease_pane(frame, snapshot, areas[1]);
-    draw_listener_pane(frame, snapshot, areas[2]);
+    draw_status_pane(frame, &state.snapshot, areas[0]);
+    draw_lease_pane(
+        frame,
+        &state.snapshot,
+        &mut state.lease_table,
+        state.focused == FocusedPane::Leases,
+        areas[1],
+    );
+    draw_listener_pane(
+        frame,
+        &state.snapshot,
+        &mut state.listener_table,
+        state.focused == FocusedPane::Listeners,
+        areas[2],
+    );
+    draw_footer(frame, areas[3]);
 }
 
 fn draw_status_pane(
@@ -279,17 +400,14 @@ fn draw_status_pane(
     let health = DaemonHealth::classify(&snapshot.daemon_probe);
     let probe = snapshot.daemon_probe.as_ref().ok();
 
+    let updated_text =
+        format_relative_secs((Utc::now() - snapshot.last_refreshed_at).num_seconds());
+
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "Portus Dashboard",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  q: quit  r: refresh",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
+        Line::from(vec![Span::styled(
+            "Portus Dashboard",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
         Line::from(vec![
             Span::raw("Daemon: "),
             Span::styled(health.label(probe), health.style()),
@@ -305,10 +423,10 @@ fn draw_status_pane(
                 snapshot.listeners.len().to_string(),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Registry: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(&snapshot.registry_path),
+            Span::styled(
+                format!("  Updated {}", updated_text),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
     ];
 
@@ -328,11 +446,20 @@ fn draw_status_pane(
 fn draw_lease_pane(
     frame: &mut ratatui::Frame<'_>,
     snapshot: &DashboardSnapshot,
+    table_state: &mut TableState,
+    focused: bool,
     area: ratatui::layout::Rect,
 ) {
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+
     let block = Block::default()
         .title("Managed Leases")
-        .borders(Borders::ALL);
+        .borders(Borders::ALL)
+        .border_style(border_style);
 
     if snapshot.leases.is_empty() {
         let empty = Paragraph::new(Line::from(vec![Span::styled(
@@ -347,52 +474,75 @@ fn draw_lease_pane(
         return;
     }
 
+    let now = Utc::now();
     let lease_rows: Vec<Row<'static>> = snapshot
         .leases
         .iter()
         .map(|lease| {
             let display = LeaseDisplay::from_state(&lease.state);
+            let (age_text, age_style) = format_lease_ttl(lease, now);
             Row::new(vec![
                 Cell::from(lease.port.to_string()),
                 Cell::from(Span::styled(display.label(), display.style())),
                 Cell::from(lease.service_name.clone()),
+                Cell::from(Span::styled(age_text, age_style)),
                 Cell::from(
                     lease
                         .client_pid
                         .map(|pid| pid.to_string())
                         .unwrap_or_else(|| "-".into()),
                 ),
-                Cell::from(shorten(&lease.project_path, 36)),
+                Cell::from(shorten(&lease.project_path, 30)),
             ])
         })
         .collect();
 
+    let highlight_style = if focused {
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
     let lease_table = Table::new(
         lease_rows,
         [
-            Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Length(18),
-            Constraint::Length(10),
-            Constraint::Min(20),
+            Constraint::Length(8),  // Port
+            Constraint::Length(12), // State
+            Constraint::Length(16), // Service
+            Constraint::Length(10), // Age/TTL
+            Constraint::Length(8),  // PID
+            Constraint::Min(16),    // Project
         ],
     )
     .header(
-        Row::new(vec!["Port", "State", "Service", "PID", "Project"])
+        Row::new(vec!["Port", "State", "Service", "Age", "PID", "Project"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
+    .row_highlight_style(highlight_style)
     .block(block);
-    frame.render_widget(lease_table, area);
+
+    frame.render_stateful_widget(lease_table, area, table_state);
 }
 
 fn draw_listener_pane(
     frame: &mut ratatui::Frame<'_>,
     snapshot: &DashboardSnapshot,
+    table_state: &mut TableState,
+    focused: bool,
     area: ratatui::layout::Rect,
 ) {
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+
     let block = Block::default()
         .title("System Listeners")
-        .borders(Borders::ALL);
+        .borders(Borders::ALL)
+        .border_style(border_style);
 
     if snapshot.listeners.is_empty() {
         let empty = Paragraph::new(Line::from(vec![Span::styled(
@@ -407,10 +557,10 @@ fn draw_listener_pane(
         return;
     }
 
+    // NOTE: `.take(12)` cap removed — scrolling handles overflow.
     let listener_rows: Vec<Row<'static>> = snapshot
         .listeners
         .iter()
-        .take(12)
         .map(|listener| {
             let ownership = ListenerOwnership::classify(listener, &snapshot.leases);
             Row::new(vec![
@@ -422,6 +572,14 @@ fn draw_listener_pane(
             ])
         })
         .collect();
+
+    let highlight_style = if focused {
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
 
     let listener_table = Table::new(
         listener_rows,
@@ -437,8 +595,70 @@ fn draw_listener_pane(
         Row::new(vec!["Port", "PID", "Proto", "Owner", "Command"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
+    .row_highlight_style(highlight_style)
     .block(block);
-    frame.render_widget(listener_table, area);
+
+    frame.render_stateful_widget(listener_table, area, table_state);
+}
+
+fn draw_footer(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect) {
+    let footer = Paragraph::new(Line::from(vec![Span::styled(
+        " ↑↓/jk: scroll  Tab: switch pane  r: refresh  q: quit",
+        Style::default().fg(Color::DarkGray),
+    )]));
+    frame.render_widget(footer, area);
+}
+
+// ── Formatting helpers ──────────────────────────────────────────────────
+
+/// Format a duration in seconds as a compact relative string (e.g. "3s ago").
+pub(crate) fn format_relative_secs(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
+/// Compact age/TTL for a lease.
+///
+/// - Approaching expiry (< 60s remaining): shows TTL in yellow/red.
+/// - Otherwise: shows age since `granted_at` in gray.
+pub(crate) fn format_lease_ttl(lease: &Lease, now: DateTime<Utc>) -> (String, Style) {
+    let ttl_secs = (lease.expires_at - now).num_seconds();
+    let age_secs = (now - lease.granted_at).num_seconds().max(0);
+
+    if ttl_secs <= 0 {
+        ("expired".into(), Style::default().fg(Color::Red))
+    } else if ttl_secs < 30 {
+        (
+            format!("{}s left", ttl_secs),
+            Style::default().fg(Color::Red),
+        )
+    } else if ttl_secs < 60 {
+        (
+            format!("{}s left", ttl_secs),
+            Style::default().fg(Color::Yellow),
+        )
+    } else if age_secs < 60 {
+        (
+            format!("{}s ago", age_secs),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else if age_secs < 3600 {
+        (
+            format!("{}m ago", age_secs / 60),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        (
+            format!("{}h ago", age_secs / 3600),
+            Style::default().fg(Color::DarkGray),
+        )
+    }
 }
 
 fn shorten(value: &str, max: usize) -> String {
@@ -622,5 +842,88 @@ mod tests {
     fn ownership_tag_text() {
         assert_eq!(ListenerOwnership::Managed.tag(), "[managed]");
         assert_eq!(ListenerOwnership::Unmanaged.tag(), "[unmanaged]");
+    }
+
+    // ── format_relative_secs ────────────────────────────────────────
+
+    #[test]
+    fn relative_seconds() {
+        assert_eq!(format_relative_secs(0), "0s ago");
+        assert_eq!(format_relative_secs(45), "45s ago");
+        assert_eq!(format_relative_secs(59), "59s ago");
+    }
+
+    #[test]
+    fn relative_minutes() {
+        assert_eq!(format_relative_secs(60), "1m ago");
+        assert_eq!(format_relative_secs(150), "2m ago");
+        assert_eq!(format_relative_secs(3599), "59m ago");
+    }
+
+    #[test]
+    fn relative_hours() {
+        assert_eq!(format_relative_secs(3600), "1h ago");
+        assert_eq!(format_relative_secs(7200), "2h ago");
+    }
+
+    #[test]
+    fn relative_negative_clamps_to_zero() {
+        assert_eq!(format_relative_secs(-5), "0s ago");
+    }
+
+    // ── format_lease_ttl ────────────────────────────────────────────
+
+    #[test]
+    fn lease_ttl_expired() {
+        let lease = make_lease(3000, Protocol::Tcp);
+        // Set `now` well past expiry.
+        let now = lease.expires_at + chrono::Duration::seconds(120);
+        let (text, style) = format_lease_ttl(&lease, now);
+        assert_eq!(text, "expired");
+        assert_eq!(style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn lease_ttl_critical() {
+        let lease = make_lease(3000, Protocol::Tcp);
+        // 15 seconds before expiry → red.
+        let now = lease.expires_at - chrono::Duration::seconds(15);
+        let (text, style) = format_lease_ttl(&lease, now);
+        assert!(text.contains("left"));
+        assert_eq!(style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn lease_ttl_warning() {
+        let lease = make_lease(3000, Protocol::Tcp);
+        // 45 seconds before expiry → yellow.
+        let now = lease.expires_at - chrono::Duration::seconds(45);
+        let (text, style) = format_lease_ttl(&lease, now);
+        assert!(text.contains("left"));
+        assert_eq!(style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn lease_ttl_healthy_shows_age() {
+        let lease = Lease::new(
+            "/tmp/test".into(),
+            "test-svc".into(),
+            3000,
+            Protocol::Tcp,
+            Some(100),
+            300,
+        );
+        let now = lease.granted_at + chrono::Duration::seconds(10);
+        let (text, style) = format_lease_ttl(&lease, now);
+        assert!(text.contains("ago"));
+        assert_eq!(style.fg, Some(Color::DarkGray));
+    }
+
+    // ── FocusedPane ─────────────────────────────────────────────────
+
+    #[test]
+    fn focused_pane_toggle() {
+        assert_eq!(FocusedPane::Leases.toggle(), FocusedPane::Listeners);
+        assert_eq!(FocusedPane::Listeners.toggle(), FocusedPane::Leases);
     }
 }
