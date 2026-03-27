@@ -22,3 +22,4 @@ tracing-subscriber = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
 interprocess = { workspace = true }
+chrono = { workspace = true }
