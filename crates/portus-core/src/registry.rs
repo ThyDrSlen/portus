@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 #[cfg(unix)]
@@ -198,12 +198,17 @@ impl Registry {
     }
 
     fn find_auto_port(&self, protocol: Protocol) -> Result<u16> {
-        let allocated_ports: Vec<u16> = self.active_leases().map(|l| l.port).collect();
-        port_check::AUTO_PORT_RANGE
-            .clone()
-            .into_iter()
-            .find(|p| !allocated_ports.contains(p) && port_check::is_port_available(*p, protocol))
-            .context("no available ports in auto-assignment range")
+        let allocated_ports: HashSet<u16> = self.active_leases().map(|lease| lease.port).collect();
+        let used_ports = port_check::get_used_ports();
+
+        port_check::find_available_port_fast(
+            port_check::AUTO_PORT_RANGE.clone(),
+            protocol,
+            &used_ports,
+            &allocated_ports,
+        )
+        .or_else(|| port_check::find_available_port(port_check::AUTO_PORT_RANGE.clone(), protocol))
+        .context("no available ports in auto-assignment range")
     }
 
     /// Confirm a lease (client successfully bound the port).
