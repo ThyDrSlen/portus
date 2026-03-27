@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -167,6 +167,8 @@ impl FocusedPane {
 /// Mutable UI state that lives across frames — scroll positions, focus, data.
 struct DashboardState {
     snapshot: DashboardSnapshot,
+    cached_listeners: Vec<PortProcess>,
+    listeners_cached_at: Instant,
     lease_table: TableState,
     listener_table: TableState,
     focused: FocusedPane,
@@ -174,9 +176,12 @@ struct DashboardState {
 
 impl DashboardState {
     fn new() -> Self {
-        let snapshot = DashboardSnapshot::load();
+        let snapshot = DashboardSnapshot::load(&[], Instant::now() - listener_scan_ttl());
+        let cached_listeners = snapshot.listeners.clone();
         let mut state = Self {
             snapshot,
+            cached_listeners,
+            listeners_cached_at: Instant::now(),
             lease_table: TableState::default(),
             listener_table: TableState::default(),
             focused: FocusedPane::Leases,
@@ -186,7 +191,11 @@ impl DashboardState {
     }
 
     fn refresh(&mut self) {
-        self.snapshot = DashboardSnapshot::load();
+        self.snapshot = DashboardSnapshot::load(&self.cached_listeners, self.listeners_cached_at);
+        self.cached_listeners = self.snapshot.listeners.clone();
+        if self.snapshot.listener_scan_ran {
+            self.listeners_cached_at = Instant::now();
+        }
         self.clamp_selections();
     }
 
@@ -306,12 +315,13 @@ struct DashboardSnapshot {
     daemon_probe: std::result::Result<DaemonProbe, String>,
     leases: Vec<Lease>,
     listeners: Vec<PortProcess>,
+    listener_scan_ran: bool,
     last_refreshed_at: DateTime<Utc>,
     error: Option<String>,
 }
 
 impl DashboardSnapshot {
-    fn load() -> Self {
+    fn load(cached_listeners: &[PortProcess], listeners_cached_at: Instant) -> Self {
         let daemon_probe = probe_daemon().map_err(|err| format!("{}", err));
 
         let mut errors = Vec::new();
@@ -323,22 +333,40 @@ impl DashboardSnapshot {
             }
         };
 
-        let listeners = match scan_ports(None) {
-            Ok(listeners) => listeners,
-            Err(err) => {
+        let (listeners, listener_scan_ran) = load_listeners(cached_listeners, listeners_cached_at)
+            .unwrap_or_else(|err| {
                 errors.push(format!("scan: {}", err));
-                Vec::new()
-            }
-        };
+                (cached_listeners.to_vec(), false)
+            });
 
         Self {
             daemon_probe,
             leases,
             listeners,
+            listener_scan_ran,
             last_refreshed_at: Utc::now(),
             error: (!errors.is_empty()).then(|| errors.join(" | ")),
         }
     }
+}
+
+fn listener_scan_ttl() -> Duration {
+    Duration::from_secs(3)
+}
+
+fn should_refresh_listeners(listeners_cached_at: Instant, now: Instant) -> bool {
+    now.duration_since(listeners_cached_at) >= listener_scan_ttl()
+}
+
+fn load_listeners(
+    cached_listeners: &[PortProcess],
+    listeners_cached_at: Instant,
+) -> Result<(Vec<PortProcess>, bool)> {
+    if !should_refresh_listeners(listeners_cached_at, Instant::now()) {
+        return Ok((cached_listeners.to_vec(), false));
+    }
+
+    scan_ports(None).map(|listeners| (listeners, true))
 }
 
 fn probe_daemon() -> Result<DaemonProbe> {
@@ -925,5 +953,27 @@ mod tests {
     fn focused_pane_toggle() {
         assert_eq!(FocusedPane::Leases.toggle(), FocusedPane::Listeners);
         assert_eq!(FocusedPane::Listeners.toggle(), FocusedPane::Leases);
+    }
+
+    #[test]
+    fn listener_scan_cache_ttl_reuses_results_for_three_seconds() {
+        let cached = vec![make_listener(3000, Protocol::Tcp)];
+
+        let (listeners, scan_ran) =
+            load_listeners(&cached, Instant::now() - Duration::from_secs(2))
+                .expect("fresh cache should be reused");
+
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].port, cached[0].port);
+        assert_eq!(listeners[0].pid, cached[0].pid);
+        assert!(!scan_ran);
+        assert!(!should_refresh_listeners(
+            Instant::now() - Duration::from_secs(2),
+            Instant::now()
+        ));
+        assert!(should_refresh_listeners(
+            Instant::now() - Duration::from_secs(3),
+            Instant::now()
+        ));
     }
 }
