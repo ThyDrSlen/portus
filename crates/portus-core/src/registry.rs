@@ -24,6 +24,7 @@ pub struct Registry {
     leases: HashMap<String, Lease>,
     /// None = in-memory only (tests), Some = persisted to disk.
     path: Option<PathBuf>,
+    dirty: bool,
 }
 
 /// Serializable wrapper for the TOML file format.
@@ -72,6 +73,7 @@ impl Registry {
         let reg = Self {
             leases,
             path: Some(path),
+            dirty: false,
         };
         if recovered > 0 || force_expired > 0 {
             reg.save()?;
@@ -84,22 +86,26 @@ impl Registry {
         Self {
             leases: HashMap::new(),
             path: None,
+            dirty: false,
         }
     }
 
-    /// Persist the registry to disk atomically (write tmp + rename).
-    /// No-op for in-memory registries.
-    pub fn save(&self) -> Result<()> {
-        let path = match &self.path {
-            Some(p) => p,
-            None => return Ok(()), // in-memory: skip
-        };
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
 
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn persistence_snapshot(&self) -> Result<String> {
         let file = RegistryFile {
             leases: self.leases.clone(),
         };
-        let content = toml::to_string_pretty(&file).context("failed to serialize registry")?;
+        toml::to_string_pretty(&file).context("failed to serialize registry")
+    }
 
+    pub fn persist_snapshot(path: &Path, data: &str) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -108,7 +114,7 @@ impl Registry {
         let mut tmp_file = File::create(&tmp_path)
             .with_context(|| format!("failed to create temp registry {}", tmp_path.display()))?;
         tmp_file
-            .write_all(content.as_bytes())
+            .write_all(data.as_bytes())
             .with_context(|| format!("failed to write temp registry {}", tmp_path.display()))?;
         tmp_file
             .sync_all()
@@ -124,7 +130,6 @@ impl Registry {
                 path.display()
             )
         })?;
-        // Sync parent directory to ensure rename is durable
         if let Some(parent) = path.parent() {
             let parent_dir = File::open(parent)
                 .with_context(|| format!("failed to open parent directory {}", parent.display()))?;
@@ -134,6 +139,23 @@ impl Registry {
         }
         debug!(path = %path.display(), "registry saved");
         Ok(())
+    }
+
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
+    /// Persist the registry to disk atomically (write tmp + rename).
+    /// No-op for in-memory registries.
+    #[allow(dead_code)]
+    pub fn save(&self) -> Result<()> {
+        let path = match &self.path {
+            Some(p) => p,
+            None => return Ok(()), // in-memory: skip
+        };
+
+        let content = self.persistence_snapshot()?;
+        Self::persist_snapshot(path, &content)
     }
 
     /// Allocate a port. If a preferred port is given and available, use it.
@@ -193,7 +215,7 @@ impl Registry {
             "allocated port"
         );
         self.leases.insert(lease.lease_id.clone(), lease.clone());
-        self.save()?;
+        self.mark_dirty();
         Ok(lease)
     }
 
@@ -222,7 +244,8 @@ impl Registry {
         }
         lease.confirm();
         info!(lease_id, "lease confirmed");
-        self.save()
+        self.mark_dirty();
+        Ok(())
     }
 
     /// Release a lease.
@@ -233,7 +256,8 @@ impl Registry {
         }
         lease.release();
         info!(lease_id, port = lease.port, "lease released");
-        self.save()
+        self.mark_dirty();
+        Ok(())
     }
 
     /// Process a heartbeat for a lease.
@@ -247,7 +271,7 @@ impl Registry {
         }
         lease.heartbeat(HEARTBEAT_EXTENSION_SECS);
         let expires = lease.expires_at.to_rfc3339();
-        self.save()?;
+        self.mark_dirty();
         Ok(expires)
     }
 
@@ -281,7 +305,7 @@ impl Registry {
             }
         }
         if expired_count > 0 {
-            self.save()?;
+            self.mark_dirty();
         }
         Ok(expired_count)
     }
@@ -310,7 +334,7 @@ impl Registry {
             }
         }
         if expired_count > 0 {
-            self.save()?;
+            self.mark_dirty();
         }
         Ok(expired_count)
     }
@@ -322,7 +346,7 @@ impl Registry {
             .retain(|_, l| matches!(l.state, LeaseState::Pending | LeaseState::Active));
         let removed = before - self.leases.len();
         if removed > 0 {
-            self.save()?;
+            self.mark_dirty();
         }
         Ok(removed)
     }
@@ -559,7 +583,48 @@ mod tests {
     }
 
     #[test]
-    fn persists_every_state_change_without_tmp_leftovers() {
+    fn dirty_flag_tracks_mutations() {
+        let mut reg = test_registry();
+        assert!(!reg.is_dirty());
+
+        reg.allocate(
+            "/tmp/myapp".into(),
+            "web".into(),
+            Some(9886),
+            Protocol::Tcp,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(reg.is_dirty());
+
+        reg.mark_clean();
+        assert!(!reg.is_dirty());
+    }
+
+    #[test]
+    fn persistence_snapshot_produces_valid_toml() {
+        let mut reg = test_registry();
+        reg.allocate(
+            "/tmp/stateful".into(),
+            "svc".into(),
+            Some(9887),
+            Protocol::Tcp,
+            false,
+            Some(4242),
+        )
+        .unwrap();
+
+        let snapshot = reg.persistence_snapshot().unwrap();
+        let parsed: RegistryFile = toml::from_str(&snapshot).unwrap();
+
+        assert_eq!(parsed.leases.len(), 1);
+        assert!(snapshot.contains("state = \"pending\""));
+    }
+
+    #[test]
+    fn persist_snapshot_writes_state_without_tmp_leftovers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state-registry.toml");
         let tmp_path = path.with_extension("toml.tmp");
@@ -575,11 +640,13 @@ mod tests {
                 Some(4242),
             )
             .unwrap();
+        Registry::persist_snapshot(&path, &reg.persistence_snapshot().unwrap()).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("state = \"pending\""));
         assert!(!tmp_path.exists());
 
         reg.confirm(&lease.lease_id, &lease.session_token).unwrap();
+        Registry::persist_snapshot(&path, &reg.persistence_snapshot().unwrap()).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("state = \"active\""));
         assert!(content.contains("confirmed_at"));
@@ -587,11 +654,13 @@ mod tests {
 
         reg.heartbeat(&lease.lease_id, &lease.session_token)
             .unwrap();
+        Registry::persist_snapshot(&path, &reg.persistence_snapshot().unwrap()).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("last_heartbeat_at"));
         assert!(!tmp_path.exists());
 
         reg.release(&lease.lease_id, &lease.session_token).unwrap();
+        Registry::persist_snapshot(&path, &reg.persistence_snapshot().unwrap()).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("state = \"released\""));
         assert!(!tmp_path.exists());
@@ -617,6 +686,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
+            reg.save().unwrap();
             lease_id = lease.lease_id.clone();
             token = lease.session_token.clone();
         }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -22,6 +23,7 @@ const STARTUP_GRACE_SECS: u64 = 30;
 
 struct DaemonState {
     registry: Registry,
+    registry_path: PathBuf,
     start_time: Instant,
     shutdown_requested: bool,
 }
@@ -54,9 +56,11 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(Mutex::new(DaemonState {
         registry,
+        registry_path,
         start_time: Instant::now(),
         shutdown_requested: false,
     }));
+    let persist_lock = Arc::new(Mutex::new(()));
 
     // Set up Unix domain socket
     let socket_path = paths::socket_path()?;
@@ -73,33 +77,51 @@ async fn main() -> Result<()> {
 
     // Spawn heartbeat sweep task
     let sweep_state = state.clone();
+    let sweep_persist_lock = persist_lock.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
         let mut last_active = Instant::now();
         loop {
             interval.tick().await;
-            let mut s = sweep_state.lock().await;
-            if s.shutdown_requested {
-                break;
-            }
-            match s.registry.expire_stale() {
-                Ok(n) if n > 0 => info!(expired = n, "sweep expired stale leases"),
-                Ok(_) => {}
-                Err(e) => warn!(error = %e, "sweep error"),
-            }
-            if s.start_time.elapsed().as_secs() >= STARTUP_GRACE_SECS {
-                match s.registry.expire_dead_clients(pid_is_alive) {
-                    Ok(n) if n > 0 => info!(expired = n, "sweep expired dead client leases"),
-                    Ok(_) => {}
-                    Err(e) => warn!(error = %e, "dead-client sweep error"),
+            let (shutdown_requested, snapshot) = {
+                let mut s = sweep_state.lock().await;
+                if s.shutdown_requested {
+                    (true, None)
+                } else {
+                    match s.registry.expire_stale() {
+                        Ok(n) if n > 0 => info!(expired = n, "sweep expired stale leases"),
+                        Ok(_) => {}
+                        Err(e) => warn!(error = %e, "sweep error"),
+                    }
+                    if s.start_time.elapsed().as_secs() >= STARTUP_GRACE_SECS {
+                        match s.registry.expire_dead_clients(pid_is_alive) {
+                            Ok(n) if n > 0 => info!(expired = n, "sweep expired dead client leases"),
+                            Ok(_) => {}
+                            Err(e) => warn!(error = %e, "dead-client sweep error"),
+                        }
+                    }
+                    if s.registry.active_count() > 0 {
+                        last_active = Instant::now();
+                    } else if last_active.elapsed().as_secs() > IDLE_TIMEOUT_SECS {
+                        info!("idle timeout reached, shutting down");
+                        s.shutdown_requested = true;
+                    }
+                    let snapshot = match take_persistence_snapshot(&mut s) {
+                        Ok(snapshot) => snapshot,
+                        Err(e) => {
+                            warn!(error = %e, "failed to prepare sweep persistence snapshot");
+                            None
+                        }
+                    };
+                    (s.shutdown_requested, snapshot)
                 }
+            };
+
+            if let Err(e) = persist_snapshot_if_needed(&sweep_state, &sweep_persist_lock, snapshot).await {
+                warn!(error = %e, "failed to persist sweep updates");
             }
-            // Idle shutdown check
-            if s.registry.active_count() > 0 {
-                last_active = Instant::now();
-            } else if last_active.elapsed().as_secs() > IDLE_TIMEOUT_SECS {
-                info!("idle timeout reached, shutting down");
-                s.shutdown_requested = true;
+
+            if shutdown_requested {
                 break;
             }
         }
@@ -119,8 +141,9 @@ async fn main() -> Result<()> {
                 match result {
                     Ok(stream) => {
                         let conn_state = state.clone();
+                        let conn_persist_lock = persist_lock.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, conn_state).await {
+                            if let Err(e) = handle_connection(stream, conn_state, conn_persist_lock).await {
                                 warn!(error = %e, "connection handler error");
                             }
                         });
@@ -148,6 +171,7 @@ async fn main() -> Result<()> {
 async fn handle_connection(
     stream: interprocess::local_socket::tokio::Stream,
     state: Arc<Mutex<DaemonState>>,
+    persist_lock: Arc<Mutex<()>>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.split();
 
@@ -161,8 +185,16 @@ async fn handle_connection(
             }
         };
 
-        let response = process_request(request, &state).await;
+        let (response, snapshot) = {
+            let mut s = state.lock().await;
+            let response = process_request_locked(request, &mut s);
+            let snapshot = take_persistence_snapshot(&mut s)?;
+            (response, snapshot)
+        };
         transport::send_json(&mut writer, &response).await?;
+        if let Err(e) = persist_snapshot_if_needed(&state, &persist_lock, snapshot).await {
+            warn!(error = %e, "failed to persist registry update");
+        }
 
         // Check if shutdown was requested
         if matches!(response, Response::ShuttingDown) {
@@ -171,9 +203,13 @@ async fn handle_connection(
     }
 }
 
+#[allow(dead_code)]
 async fn process_request(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response {
     let mut s = state.lock().await;
+    process_request_locked(request, &mut s)
+}
 
+fn process_request_locked(request: Request, s: &mut DaemonState) -> Response {
     match request {
         Request::Allocate {
             project,
@@ -245,6 +281,41 @@ async fn process_request(request: Request, state: &Arc<Mutex<DaemonState>>) -> R
             info!("shutdown requested via IPC");
             s.shutdown_requested = true;
             Response::ShuttingDown
+        }
+    }
+}
+
+fn take_persistence_snapshot(s: &mut DaemonState) -> Result<Option<(PathBuf, String)>> {
+    if !s.registry.is_dirty() {
+        return Ok(None);
+    }
+
+    let data = s.registry.persistence_snapshot()?;
+    s.registry.mark_clean();
+    Ok(Some((s.registry_path.clone(), data)))
+}
+
+async fn persist_snapshot_if_needed(
+    state: &Arc<Mutex<DaemonState>>,
+    persist_lock: &Arc<Mutex<()>>,
+    snapshot: Option<(PathBuf, String)>,
+) -> Result<()> {
+    let Some((path, data)) = snapshot else {
+        return Ok(());
+    };
+
+    let _persist_guard = persist_lock.lock().await;
+    let result = tokio::task::spawn_blocking(move || Registry::persist_snapshot(&path, &data)).await;
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            state.lock().await.registry.mark_dirty();
+            Err(e)
+        }
+        Err(e) => {
+            state.lock().await.registry.mark_dirty();
+            Err(e.into())
         }
     }
 }
