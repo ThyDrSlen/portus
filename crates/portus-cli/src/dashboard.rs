@@ -2,7 +2,7 @@ use std::io::{self, IsTerminal};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,9 +23,18 @@ pub fn run_dashboard() -> Result<()> {
         bail!("dashboard requires an interactive terminal");
     }
 
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, crossterm::cursor::Show, LeaveAlternateScreen);
+        original_hook(info);
+    }));
+
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+    execute!(stdout, crossterm::cursor::Hide).context("failed to hide cursor")?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout);
@@ -40,6 +49,7 @@ pub fn run_dashboard() -> Result<()> {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('r') => snapshot = DashboardSnapshot::load(),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     _ => {}
                 }
             }
@@ -57,7 +67,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen);
+        let _ = execute!(stdout, crossterm::cursor::Show, LeaveAlternateScreen);
     }
 }
 
@@ -125,6 +135,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, snapshot: &DashboardSnapshot) 
         Constraint::Length(5),
         Constraint::Min(8),
         Constraint::Min(8),
+        Constraint::Length(1),
     ])
     .split(frame.area());
 
@@ -134,7 +145,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, snapshot: &DashboardSnapshot) 
                 "Portus Dashboard",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  q: quit  r: refresh"),
+            Span::raw("  q/Esc: quit  r: refresh  Ctrl+C: interrupt"),
         ]),
         Line::from(format!("Daemon: {}", snapshot.daemon_status)),
         Line::from(format!(
@@ -246,6 +257,16 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, snapshot: &DashboardSnapshot) 
             .borders(Borders::ALL),
     );
     frame.render_widget(listener_table, areas[2]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" q", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" quit  "),
+        Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" refresh  "),
+        Span::styled("Ctrl+C", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" interrupt"),
+    ]));
+    frame.render_widget(footer, areas[3]);
 }
 
 fn shorten(value: &str, max: usize) -> String {
