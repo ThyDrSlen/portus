@@ -197,7 +197,7 @@ async fn main() -> Result<()> {
             dry_run,
         } => {
             if dry_run {
-                let port = port.context("--dry-run requires --port")?;
+                let port = port.context("--dry-run requires --port to be specified. Example: portus request --service web --port 3000 --dry-run")?;
                 let bindable = port_check::is_port_available(port, Protocol::Tcp);
                 let leases = helpers::load_active_leases()?;
                 let managed = leases.iter().find(|l| l.port == port && l.protocol == Protocol::Tcp);
@@ -448,7 +448,21 @@ async fn main() -> Result<()> {
             } else {
                 let killed = kill_processes_on_port(port, signal)?;
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                    let result = serde_json::json!({
+                        "port": port,
+                        "signal": signal,
+                        "processes_signaled": killed
+                            .iter()
+                            .map(|p| serde_json::json!({
+                                "pid": p.pid,
+                                "port": p.port,
+                                "protocol": format!("{:?}", p.protocol).to_lowercase(),
+                                "command": p.command,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "count": unique_pid_count(&killed),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&result)?);
                 } else {
                     println!("✓ Sent {} to {} process(es) on port {}", signal, unique_pid_count(&killed), port);
                     for row in rows {
@@ -536,10 +550,12 @@ async fn main() -> Result<()> {
                     tokio::select! {
                         _ = &mut heartbeat_rx => break,
                         _ = interval.tick() => {
-                            let _ = send_request(Request::Heartbeat {
+                            if let Err(e) = send_request(Request::Heartbeat {
                                 lease_id: heartbeat_lease_id.clone(),
                                 session_token: heartbeat_token.clone(),
-                            }).await;
+                            }).await {
+                                eprintln!("⚠ heartbeat failed: {} — lease may expire if daemon is unreachable", e);
+                            }
                         }
                     }
                 }
@@ -766,16 +782,26 @@ pub(crate) async fn send_request(request: Request) -> Result<Response> {
 
     let stream = match ipc::connect(&socket_path).await {
         Ok(s) => s,
-        Err(_) => {
+        Err(_initial_err) => {
             eprintln!("Starting portus daemon...");
-            start_daemon().await?;
+            let mut last_err = None;
+            match start_daemon().await {
+                Ok(()) => {}
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
             for _ in 0..20 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 if let Ok(s) = ipc::connect(&socket_path).await {
                     return send_on_stream(s, request).await;
                 }
             }
-            bail!("daemon did not start in time");
+            if let Some(err) = last_err {
+                bail!("daemon failed to start: {}\n  Try: portus daemon start", err);
+            } else {
+                bail!("daemon did not start in time\n  Try: portus daemon start");
+            }
         }
     };
 
