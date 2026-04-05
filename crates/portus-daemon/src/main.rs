@@ -1,11 +1,13 @@
 use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use interprocess::local_socket::traits::tokio::Listener as _;
 use interprocess::local_socket::traits::tokio::Stream as _;
+#[cfg(unix)]
+use tokio::signal::unix::SignalKind;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -60,12 +62,24 @@ async fn main() -> Result<()> {
 
     // Set up Unix domain socket
     let socket_path = paths::socket_path()?;
-    // Remove stale socket file if present
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path).ok();
-    }
-    let listener = ipc::bind(&socket_path)
-        .with_context(|| format!("failed to bind IPC listener at {}", socket_path.display()))?;
+    let listener = match ipc::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(bind_error) => {
+            if socket_path.exists() {
+                std::fs::remove_file(&socket_path).with_context(|| {
+                    format!("failed to remove stale socket: {}", socket_path.display())
+                })?;
+                warn!(
+                    path = %socket_path.display(),
+                    error = %bind_error,
+                    "removed stale socket file after bind failure"
+                );
+            }
+            ipc::bind(&socket_path).with_context(|| {
+                format!("failed to bind IPC listener at {}", socket_path.display())
+            })?
+        }
+    };
     #[cfg(unix)]
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed to set socket permissions: {}", socket_path.display()))?;
@@ -73,8 +87,97 @@ async fn main() -> Result<()> {
 
     // Spawn heartbeat sweep task
     let sweep_state = state.clone();
+    let mut sweep_task = spawn_sweep_task(sweep_state);
+
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(SignalKind::terminate())?;
+
+    // Accept connections
+    loop {
+        {
+            let s = state.lock().await;
+            if s.shutdown_requested {
+                break;
+            }
+        }
+
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok(stream) => {
+                        let conn_state = state.clone();
+                        tokio::spawn(async move {
+                            match tokio::time::timeout(
+                                Duration::from_secs(30),
+                                handle_connection(stream, conn_state),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    warn!(error = %e, "connection handler error");
+                                }
+                                Err(_) => {
+                                    warn!(timeout_secs = 30, "connection handler timed out");
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!(error = %e, "accept error");
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+            result = &mut sweep_task => {
+                let shutdown_requested = {
+                    let s = state.lock().await;
+                    s.shutdown_requested
+                };
+                match result {
+                    Ok(Ok(())) if shutdown_requested => {}
+                    Ok(Ok(())) => {
+                        warn!("sweep task exited unexpectedly; restarting");
+                        sweep_task = spawn_sweep_task(state.clone());
+                    }
+                    Ok(Err(e)) => {
+                        error!(error = %e, "sweep task failed; restarting");
+                        sweep_task = spawn_sweep_task(state.clone());
+                    }
+                    Err(e) => {
+                        error!(error = %e, "sweep task panicked; restarting");
+                        sweep_task = spawn_sweep_task(state.clone());
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("received SIGINT, shutting down");
+                break;
+            }
+            #[cfg(unix)]
+            _ = terminate.recv() => {
+                info!("received SIGTERM, shutting down");
+                break;
+            }
+        }
+    }
+
+    // Cleanup
+    info!("daemon shutting down");
+    if let Err(e) = std::fs::remove_file(&socket_path) {
+        warn!(error = %e, path = %socket_path.display(), "failed to remove socket file during cleanup");
+    }
+    if let Err(e) = std::fs::remove_file(&pid_path) {
+        warn!(error = %e, path = %pid_path.display(), "failed to remove pid file during cleanup");
+    }
+    Ok(())
+}
+
+fn spawn_sweep_task(
+    sweep_state: Arc<Mutex<DaemonState>>,
+) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
+        let mut interval = tokio::time::interval(Duration::from_secs(SWEEP_INTERVAL_SECS));
         let mut last_active = Instant::now();
         loop {
             interval.tick().await;
@@ -94,7 +197,6 @@ async fn main() -> Result<()> {
                     Err(e) => warn!(error = %e, "dead-client sweep error"),
                 }
             }
-            // Idle shutdown check
             if s.registry.active_count() > 0 {
                 last_active = Instant::now();
             } else if last_active.elapsed().as_secs() > IDLE_TIMEOUT_SECS {
@@ -103,46 +205,8 @@ async fn main() -> Result<()> {
                 break;
             }
         }
-    });
-
-    // Accept connections
-    loop {
-        {
-            let s = state.lock().await;
-            if s.shutdown_requested {
-                break;
-            }
-        }
-
-        tokio::select! {
-            result = listener.accept() => {
-                match result {
-                    Ok(stream) => {
-                        let conn_state = state.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, conn_state).await {
-                                warn!(error = %e, "connection handler error");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        error!(error = %e, "accept error");
-                    }
-                }
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
-            _ = tokio::signal::ctrl_c() => {
-                info!("received SIGINT, shutting down");
-                break;
-            }
-        }
-    }
-
-    // Cleanup
-    info!("daemon shutting down");
-    std::fs::remove_file(&socket_path).ok();
-    std::fs::remove_file(&pid_path).ok();
-    Ok(())
+        Ok(())
+    })
 }
 
 async fn handle_connection(
