@@ -750,4 +750,46 @@ mod tests {
         let lease = reg.leases.get(&lease_id).unwrap();
         assert_eq!(lease.state, LeaseState::Expired);
     }
+
+    #[test]
+    fn load_corrupt_toml_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.toml");
+        std::fs::write(&path, "this is not valid toml {{{{").unwrap();
+        let result = Registry::load(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("parse") || err.contains("TOML") || err.contains("expected"),
+            "error should mention parsing: got '{}'",
+            err
+        );
+    }
+
+    #[test]
+    fn load_empty_file_succeeds_with_no_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.toml");
+        std::fs::write(&path, "").unwrap();
+        let reg = Registry::load(&path).unwrap();
+        assert_eq!(reg.active_count(), 0);
+    }
+
+    #[test]
+    fn load_toml_with_no_leases_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-leases.toml");
+        std::fs::write(&path, "# just a comment\n").unwrap();
+        let reg = Registry::load(&path).unwrap();
+        assert_eq!(reg.active_count(), 0);
+    }
+
+    #[test]
+    fn load_nonexistent_file_creates_fresh_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.toml");
+        assert!(!path.exists());
+        let reg = Registry::load(&path).unwrap();
+        assert_eq!(reg.active_count(), 0);
+    }
 }

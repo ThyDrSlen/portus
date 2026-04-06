@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Protocol;
 
+/// Maximum length for process command names from lsof/netstat output.
+const MAX_COMMAND_LEN: usize = 256;
+
 /// Information about a process listening on a port.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortProcess {
@@ -160,7 +163,7 @@ fn parse_lsof_output(output: &str, protocol: Protocol) -> Vec<PortProcess> {
         let entry = PortProcess {
             port,
             pid,
-            command: columns[0].to_string(),
+            command: truncate_command(columns[0]),
             protocol,
         };
 
@@ -203,6 +206,20 @@ fn extract_port_from_token(token: &str) -> Option<u16> {
     digits.parse().ok()
 }
 
+/// Truncate a command name to MAX_COMMAND_LEN, appending "…" if truncated.
+fn truncate_command(s: &str) -> String {
+    if s.len() <= MAX_COMMAND_LEN {
+        s.to_string()
+    } else {
+        let mut truncated = s[..MAX_COMMAND_LEN].to_string();
+        while truncated.len() > MAX_COMMAND_LEN - '…'.len_utf8() {
+            truncated.pop();
+        }
+        truncated.push('…');
+        truncated
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +228,57 @@ mod tests {
     fn parses_listen_line_port() {
         let line = "Python 123 user 4u IPv4 0x123 0t0 TCP 127.0.0.1:43123 (LISTEN)";
         assert_eq!(extract_port(line), Some(43123));
+    }
+
+    #[test]
+    fn extract_port_from_ipv6_listen() {
+        // lsof format for IPv6: TCP [::1]:8080 (LISTEN)
+        let line = "node   456 user 12u IPv6 0xabc 0t0 TCP [::1]:8080 (LISTEN)";
+        assert_eq!(extract_port(line), Some(8080));
+    }
+
+    #[test]
+    fn extract_port_from_wildcard_listen() {
+        let line = "node   789 user 12u IPv4 0xdef 0t0 TCP *:3000 (LISTEN)";
+        assert_eq!(extract_port(line), Some(3000));
+    }
+
+    #[test]
+    fn extract_port_returns_none_for_no_port() {
+        assert_eq!(extract_port_from_token("no-colon-here"), None);
+    }
+
+    #[test]
+    fn extract_port_returns_none_for_non_numeric() {
+        assert_eq!(extract_port_from_token("host:abc"), None);
+    }
+
+    #[test]
+    fn extract_port_handles_arrow_notation() {
+        // lsof sometimes shows "host:port->host:port"
+        assert_eq!(
+            extract_port_from_token("127.0.0.1:9090->10.0.0.1:443"),
+            Some(9090)
+        );
+    }
+
+    #[test]
+    fn truncate_command_within_limit() {
+        assert_eq!(truncate_command("node"), "node");
+    }
+
+    #[test]
+    fn truncate_command_at_limit() {
+        let exactly = "a".repeat(MAX_COMMAND_LEN);
+        assert_eq!(truncate_command(&exactly), exactly);
+    }
+
+    #[test]
+    fn truncate_command_over_limit() {
+        let long = "b".repeat(MAX_COMMAND_LEN + 100);
+        let result = truncate_command(&long);
+        assert_eq!(result.len(), MAX_COMMAND_LEN);
+        assert!(result.ends_with('…'));
     }
 }
 
@@ -280,7 +348,7 @@ fn parse_netstat_output(
         let entry = PortProcess {
             port,
             pid,
-            command,
+            command: truncate_command(&command),
             protocol,
         };
         if seen.insert((entry.port, entry.pid, format!("{:?}", entry.protocol))) {
