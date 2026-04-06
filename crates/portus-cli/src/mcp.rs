@@ -158,6 +158,54 @@ struct DaemonStatusResult {
     active_leases: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct McpError {
+    error_code: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggestion: Option<String>,
+}
+
+fn format_mcp_error(code: &str, message: &str) -> String {
+    let suggestion = match code {
+        "allocation_failed" if message.contains("already allocated") => {
+            Some("Release the existing lease with release_port, or use auto_reassign=true".into())
+        }
+        "allocation_failed" if message.contains("in use by another process") => Some(
+            "Use a different port or set auto_reassign=true to get the next available port".into(),
+        ),
+        "not_found" => Some("Verify the lease_id is correct using list_ports".into()),
+        "invalid_token" => Some("Use the exact token returned by allocate_port".into()),
+        _ => None,
+    };
+
+    let error = McpError {
+        error_code: code.to_string(),
+        message: message.to_string(),
+        suggestion,
+    };
+    serde_json::to_string(&error).unwrap_or_else(|_| message.to_string())
+}
+
+fn validate_service_name(service: &str) -> Result<(), String> {
+    if service.trim().is_empty() {
+        return Err(format_mcp_error(
+            "invalid_input",
+            "service name must not be empty",
+        ));
+    }
+    if service.len() > portus_core::model::MAX_SERVICE_NAME_LEN {
+        return Err(format_mcp_error(
+            "invalid_input",
+            &format!(
+                "service name exceeds maximum length of {} bytes",
+                portus_core::model::MAX_SERVICE_NAME_LEN
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[tool_router(router = tool_router)]
 impl PortusServer {
     #[tool(description = "Reserve a TCP port for a service before starting a dev server. Returns a lease with port number, lease_id, and token. If the preferred port is taken, set auto_reassign=true to get the next available port. The daemon auto-starts on first call. NEVER use lsof/kill to free ports — use release_port or auto_reassign instead.")]
@@ -165,6 +213,7 @@ impl PortusServer {
         &self,
         Parameters(params): Parameters<AllocatePortParams>,
     ) -> Result<Json<AllocatePortResult>, String> {
+        validate_service_name(&params.service)?;
         let project = crate::resolve_project(params.project).map_err(|err| err.to_string())?;
         let response = crate::send_request(Request::Allocate {
             project,
@@ -184,7 +233,7 @@ impl PortusServer {
                 token: lease.session_token,
                 expires_at: lease.expires_at.to_rfc3339(),
             })),
-            Response::Error { code, message } => Err(crate::format_daemon_error(&code, &message)),
+            Response::Error { code, message } => Err(format_mcp_error(&code, &message)),
             other => Err(format!("unexpected response: {:?}", other)),
         }
     }
@@ -206,7 +255,7 @@ impl PortusServer {
                 released: true,
                 lease_id,
             })),
-            Response::Error { code, message } => Err(crate::format_daemon_error(&code, &message)),
+            Response::Error { code, message } => Err(format_mcp_error(&code, &message)),
             other => Err(format!("unexpected response: {:?}", other)),
         }
     }
@@ -228,7 +277,7 @@ impl PortusServer {
             Response::LeaseList { leases } => Ok(Json(ListPortsResult {
                 leases: leases.iter().map(LeaseInfo::from).collect(),
             })),
-            Response::Error { code, message } => Err(crate::format_daemon_error(&code, &message)),
+            Response::Error { code, message } => Err(format_mcp_error(&code, &message)),
             other => Err(format!("unexpected response: {:?}", other)),
         }
     }
@@ -246,7 +295,7 @@ impl PortusServer {
 
         let leases = match response {
             Response::LeaseList { leases } => leases,
-            Response::Error { code, message } => return Err(crate::format_daemon_error(&code, &message)),
+            Response::Error { code, message } => return Err(format_mcp_error(&code, &message)),
             other => return Err(format!("unexpected response: {:?}", other)),
         };
 
@@ -298,7 +347,7 @@ impl PortusServer {
                 uptime: uptime_secs,
                 active_leases,
             })),
-            Response::Error { code, message } => Err(crate::format_daemon_error(&code, &message)),
+            Response::Error { code, message } => Err(format_mcp_error(&code, &message)),
             other => Err(format!("unexpected response: {:?}", other)),
         }
     }
@@ -453,5 +502,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn format_mcp_error_includes_code_and_message() {
+        let result = format_mcp_error("allocation_failed", "port 3000 is already allocated");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["error_code"], "allocation_failed");
+        assert!(parsed["message"].as_str().unwrap().contains("already allocated"));
+        assert!(parsed["suggestion"].as_str().is_some());
+    }
+
+    #[test]
+    fn format_mcp_error_omits_suggestion_for_unknown_code() {
+        let result = format_mcp_error("unknown_error", "something went wrong");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["error_code"], "unknown_error");
+        assert!(parsed.get("suggestion").is_none() || parsed["suggestion"].is_null());
+    }
+
+    #[test]
+    fn validate_service_name_rejects_empty() {
+        assert!(validate_service_name("").is_err());
+        assert!(validate_service_name("   ").is_err());
+    }
+
+    #[test]
+    fn validate_service_name_accepts_valid() {
+        assert!(validate_service_name("web-server").is_ok());
+        assert!(validate_service_name("a").is_ok());
+    }
+
+    #[test]
+    fn validate_service_name_rejects_oversized() {
+        let long = "x".repeat(portus_core::model::MAX_SERVICE_NAME_LEN + 1);
+        assert!(validate_service_name(&long).is_err());
     }
 }
