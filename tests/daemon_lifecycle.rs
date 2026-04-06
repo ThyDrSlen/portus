@@ -459,3 +459,274 @@ async fn error_handling() -> Result<()> {
     daemon.wait_for_exit()?;
     Ok(())
 }
+
+#[tokio::test]
+async fn list_with_project_filter() -> Result<()> {
+    let mut daemon = DaemonHarness::start().await?;
+    let stream = daemon.connect().await?;
+    let (mut reader, mut writer) = stream.split();
+
+    let resp_a = send_request(
+        &mut reader,
+        &mut writer,
+        Request::Allocate {
+            project: "/home/user/app-alpha".into(),
+            service: "web".into(),
+            preferred_port: None,
+            protocol: Protocol::Tcp,
+            auto_reassign: false,
+            pid: Some(std::process::id()),
+        },
+    )
+    .await?;
+    let lease_a = match resp_a {
+        Response::Allocated { lease } => lease,
+        other => bail!("expected allocated, got {other:?}"),
+    };
+
+    let resp_b = send_request(
+        &mut reader,
+        &mut writer,
+        Request::Allocate {
+            project: "/home/user/app-beta".into(),
+            service: "api".into(),
+            preferred_port: None,
+            protocol: Protocol::Tcp,
+            auto_reassign: false,
+            pid: Some(std::process::id()),
+        },
+    )
+    .await?;
+    let lease_b = match resp_b {
+        Response::Allocated { lease } => lease,
+        other => bail!("expected allocated, got {other:?}"),
+    };
+
+    let filtered = send_request(
+        &mut reader,
+        &mut writer,
+        Request::List {
+            project_filter: Some("/home/user/app-alpha".into()),
+        },
+    )
+    .await?;
+    match filtered {
+        Response::LeaseList { leases } => {
+            assert_eq!(leases.len(), 1, "filter should return exactly 1 lease");
+            assert_eq!(leases[0].lease_id, lease_a.lease_id);
+        }
+        other => bail!("expected lease list, got {other:?}"),
+    }
+
+    let all = send_request(
+        &mut reader,
+        &mut writer,
+        Request::List {
+            project_filter: None,
+        },
+    )
+    .await?;
+    match all {
+        Response::LeaseList { leases } => {
+            assert_eq!(leases.len(), 2, "unfiltered should return 2 leases");
+        }
+        other => bail!("expected lease list, got {other:?}"),
+    }
+
+    send_request(
+        &mut reader,
+        &mut writer,
+        Request::Release {
+            lease_id: lease_a.lease_id,
+            session_token: lease_a.session_token,
+        },
+    )
+    .await?;
+    send_request(
+        &mut reader,
+        &mut writer,
+        Request::Release {
+            lease_id: lease_b.lease_id,
+            session_token: lease_b.session_token,
+        },
+    )
+    .await?;
+
+    let shutdown = send_request(&mut reader, &mut writer, Request::Shutdown).await?;
+    assert!(matches!(shutdown, Response::ShuttingDown));
+    drop(reader);
+    drop(writer);
+    daemon.wait_for_exit()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn release_nonexistent_lease() -> Result<()> {
+    let mut daemon = DaemonHarness::start().await?;
+    let stream = daemon.connect().await?;
+    let (mut reader, mut writer) = stream.split();
+
+    let resp = send_request(
+        &mut reader,
+        &mut writer,
+        Request::Release {
+            lease_id: "nonexistent-lease-id".into(),
+            session_token: "fake-token".into(),
+        },
+    )
+    .await?;
+
+    match resp {
+        Response::Error { code, message } => {
+            assert_eq!(code, "release_failed");
+            assert!(
+                message.contains("not found"),
+                "error should mention 'not found', got: {message}"
+            );
+        }
+        other => bail!("expected error for nonexistent lease, got {other:?}"),
+    }
+
+    let shutdown = send_request(&mut reader, &mut writer, Request::Shutdown).await?;
+    assert!(matches!(shutdown, Response::ShuttingDown));
+    drop(reader);
+    drop(writer);
+    daemon.wait_for_exit()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn heartbeat_on_pending_lease() -> Result<()> {
+    let mut daemon = DaemonHarness::start().await?;
+    let stream = daemon.connect().await?;
+    let (mut reader, mut writer) = stream.split();
+
+    let resp = send_request(
+        &mut reader,
+        &mut writer,
+        Request::Allocate {
+            project: "/tmp/portus/heartbeat_pending".into(),
+            service: "svc".into(),
+            preferred_port: None,
+            protocol: Protocol::Tcp,
+            auto_reassign: false,
+            pid: Some(std::process::id()),
+        },
+    )
+    .await?;
+    let lease = match resp {
+        Response::Allocated { lease } => {
+            assert_eq!(lease.state, LeaseState::Pending);
+            lease
+        }
+        other => bail!("expected allocated, got {other:?}"),
+    };
+
+    let heartbeat = send_request(
+        &mut reader,
+        &mut writer,
+        Request::Heartbeat {
+            lease_id: lease.lease_id.clone(),
+            session_token: lease.session_token.clone(),
+        },
+    )
+    .await?;
+    match heartbeat {
+        Response::Error { code, message } => {
+            assert_eq!(code, "heartbeat_failed");
+            assert!(
+                message.contains("not active"),
+                "error should mention 'not active', got: {message}"
+            );
+        }
+        other => bail!("expected error for heartbeat on pending, got {other:?}"),
+    }
+
+    send_request(
+        &mut reader,
+        &mut writer,
+        Request::Release {
+            lease_id: lease.lease_id,
+            session_token: lease.session_token,
+        },
+    )
+    .await?;
+    let shutdown = send_request(&mut reader, &mut writer, Request::Shutdown).await?;
+    assert!(matches!(shutdown, Response::ShuttingDown));
+    drop(reader);
+    drop(writer);
+    daemon.wait_for_exit()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn double_confirm_rejected() -> Result<()> {
+    let mut daemon = DaemonHarness::start().await?;
+    let stream = daemon.connect().await?;
+    let (mut reader, mut writer) = stream.split();
+
+    let resp = send_request(
+        &mut reader,
+        &mut writer,
+        Request::Allocate {
+            project: "/tmp/portus/double_confirm".into(),
+            service: "svc".into(),
+            preferred_port: None,
+            protocol: Protocol::Tcp,
+            auto_reassign: false,
+            pid: Some(std::process::id()),
+        },
+    )
+    .await?;
+    let lease = match resp {
+        Response::Allocated { lease } => lease,
+        other => bail!("expected allocated, got {other:?}"),
+    };
+
+    let confirmed = send_request(
+        &mut reader,
+        &mut writer,
+        Request::Confirm {
+            lease_id: lease.lease_id.clone(),
+            session_token: lease.session_token.clone(),
+        },
+    )
+    .await?;
+    assert!(matches!(confirmed, Response::Confirmed { .. }));
+
+    let double = send_request(
+        &mut reader,
+        &mut writer,
+        Request::Confirm {
+            lease_id: lease.lease_id.clone(),
+            session_token: lease.session_token.clone(),
+        },
+    )
+    .await?;
+    match double {
+        Response::Error { code, message } => {
+            assert_eq!(code, "confirm_failed");
+            assert!(
+                message.contains("not in pending state"),
+                "error should mention not pending, got: {message}"
+            );
+        }
+        other => bail!("expected error for double confirm, got {other:?}"),
+    }
+
+    send_request(
+        &mut reader,
+        &mut writer,
+        Request::Release {
+            lease_id: lease.lease_id,
+            session_token: lease.session_token,
+        },
+    )
+    .await?;
+    let shutdown = send_request(&mut reader, &mut writer, Request::Shutdown).await?;
+    assert!(matches!(shutdown, Response::ShuttingDown));
+    drop(reader);
+    drop(writer);
+    daemon.wait_for_exit()?;
+    Ok(())
+}
