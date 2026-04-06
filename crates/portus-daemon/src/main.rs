@@ -101,6 +101,13 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Build the SIGTERM future outside select! to avoid #[cfg] inside the macro
+        // (tokio::select! does not reliably support #[cfg] on arms in all versions)
+        #[cfg(unix)]
+        let term_fut = terminate.recv();
+        #[cfg(not(unix))]
+        let term_fut = std::future::pending::<Option<()>>();
+
         tokio::select! {
             result = listener.accept() => {
                 match result {
@@ -154,8 +161,7 @@ async fn main() -> Result<()> {
                 info!("received SIGINT, shutting down");
                 break;
             }
-            #[cfg(unix)]
-            _ = terminate.recv() => {
+            _ = term_fut => {
                 info!("received SIGTERM, shutting down");
                 break;
             }
