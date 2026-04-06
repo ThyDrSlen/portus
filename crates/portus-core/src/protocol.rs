@@ -40,9 +40,7 @@ pub enum Request {
         session_token: String,
     },
     /// List active leases, optionally filtered by project.
-    List {
-        project_filter: Option<String>,
-    },
+    List { project_filter: Option<String> },
     /// Request daemon status.
     Status,
     /// Graceful daemon shutdown (used by CLI `daemon stop`).
@@ -54,26 +52,18 @@ pub enum Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     /// Port successfully allocated.
-    Allocated {
-        lease: Lease,
-    },
+    Allocated { lease: Lease },
     /// Lease confirmed.
-    Confirmed {
-        lease_id: String,
-    },
+    Confirmed { lease_id: String },
     /// Lease released.
-    Released {
-        lease_id: String,
-    },
+    Released { lease_id: String },
     /// Heartbeat acknowledged with next deadline.
     HeartbeatAck {
         lease_id: String,
         expires_at: String,
     },
     /// List of leases.
-    LeaseList {
-        leases: Vec<Lease>,
-    },
+    LeaseList { leases: Vec<Lease> },
     /// Daemon status information.
     DaemonStatus {
         pid: u32,
@@ -84,10 +74,7 @@ pub enum Response {
     /// Shutdown acknowledged.
     ShuttingDown,
     /// Error response.
-    Error {
-        code: String,
-        message: String,
-    },
+    Error { code: String, message: String },
 }
 
 impl Response {
@@ -96,6 +83,67 @@ impl Response {
         Self::Error {
             code: code.into(),
             message: message.into(),
+        }
+    }
+}
+
+impl Request {
+    /// Validate string field lengths in this request.
+    /// Returns an error describing the first invalid field found.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Request::Allocate {
+                project, service, ..
+            } => {
+                if service.trim().is_empty() {
+                    return Err("service name must not be empty".into());
+                }
+                if service.len() > crate::model::MAX_SERVICE_NAME_LEN {
+                    return Err(format!(
+                        "service name exceeds maximum length of {} bytes",
+                        crate::model::MAX_SERVICE_NAME_LEN
+                    ));
+                }
+                if project.len() > crate::model::MAX_PROJECT_PATH_LEN {
+                    return Err(format!(
+                        "project path exceeds maximum length of {} bytes",
+                        crate::model::MAX_PROJECT_PATH_LEN
+                    ));
+                }
+                Ok(())
+            }
+            Request::Confirm {
+                lease_id,
+                session_token,
+            }
+            | Request::Release {
+                lease_id,
+                session_token,
+            }
+            | Request::Heartbeat {
+                lease_id,
+                session_token,
+            } => {
+                if lease_id.trim().is_empty() {
+                    return Err("lease_id must not be empty".into());
+                }
+                if session_token.trim().is_empty() {
+                    return Err("session_token must not be empty".into());
+                }
+                Ok(())
+            }
+            Request::List { project_filter } => {
+                if let Some(filter) = project_filter {
+                    if filter.len() > crate::model::MAX_PROJECT_PATH_LEN {
+                        return Err(format!(
+                            "project filter exceeds maximum length of {} bytes",
+                            crate::model::MAX_PROJECT_PATH_LEN
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Request::Status | Request::Shutdown => Ok(()),
         }
     }
 }
@@ -177,5 +225,87 @@ mod tests {
             Request::List { project_filter } => assert!(project_filter.is_none()),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn validate_rejects_empty_service() {
+        let req = Request::Allocate {
+            project: "/tmp/app".into(),
+            service: "".into(),
+            preferred_port: None,
+            protocol: Protocol::Tcp,
+            auto_reassign: false,
+            pid: None,
+        };
+        assert!(req.validate().is_err());
+        assert!(req.validate().unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_service() {
+        let req = Request::Allocate {
+            project: "/tmp/app".into(),
+            service: "   ".into(),
+            preferred_port: None,
+            protocol: Protocol::Tcp,
+            auto_reassign: false,
+            pid: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_oversized_service() {
+        let req = Request::Allocate {
+            project: "/tmp/app".into(),
+            service: "x".repeat(crate::model::MAX_SERVICE_NAME_LEN + 1),
+            preferred_port: None,
+            protocol: Protocol::Tcp,
+            auto_reassign: false,
+            pid: None,
+        };
+        assert!(req.validate().is_err());
+        assert!(req.validate().unwrap_err().contains("maximum length"));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_project() {
+        let req = Request::Allocate {
+            project: "p".repeat(crate::model::MAX_PROJECT_PATH_LEN + 1),
+            service: "web".into(),
+            preferred_port: None,
+            protocol: Protocol::Tcp,
+            auto_reassign: false,
+            pid: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_valid_allocate() {
+        let req = Request::Allocate {
+            project: "/home/user/app".into(),
+            service: "web-server".into(),
+            preferred_port: Some(3000),
+            protocol: Protocol::Tcp,
+            auto_reassign: false,
+            pid: Some(1234),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_lease_id() {
+        let req = Request::Confirm {
+            lease_id: "".into(),
+            session_token: "tok-123".into(),
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_status_and_shutdown() {
+        assert!(Request::Status.validate().is_ok());
+        assert!(Request::Shutdown.validate().is_ok());
     }
 }

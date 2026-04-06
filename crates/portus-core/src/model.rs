@@ -2,6 +2,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Maximum length for service names in lease requests.
+pub const MAX_SERVICE_NAME_LEN: usize = 128;
+/// Maximum length for project paths in lease requests.
+pub const MAX_PROJECT_PATH_LEN: usize = 512;
+
 /// State of a port lease through its lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
